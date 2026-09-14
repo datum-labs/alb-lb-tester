@@ -1,176 +1,25 @@
-/*
- * Theme tokens adopted from @datum-cloud/datum-ui (design-system) v2.9.x,
- * themes/alpha.css + figma-tokens.css. Values copied so this standalone
- * tester matches the Datum look without pulling in the Tailwind v4 toolchain.
- */
-:root {
-  color-scheme: light dark;
+@import 'tailwindcss';
+@import '@datum-cloud/datum-ui/styles';
+@import '@datum-cloud/datum-ui/styles/canela';
 
-  /* Surfaces — light */
-  --bg: oklch(0.973 0.001 106.4);        /* glacier-mist-700  #fcfdf7 */
-  --panel: oklch(1 0 0);                 /* white card */
-  --panel-2: oklch(0.966 0.002 106.4);   /* subtle secondary fill */
-  --field: oklch(0.985 0.001 106.4);     /* input fill, barely off-white */
-  --border: oklch(0.925 0.003 106.4);    /* hairline */
-  --text: oklch(0.228 0.045 253.7);      /* midnight-fjord  #0c1d31 */
-  --muted: oklch(0.55 0.02 253);
+/* Scan datum-ui's compiled components so their Tailwind utilities are kept. */
+@source '../node_modules/@datum-cloud/datum-ui/dist/**/*.mjs';
 
-  /* Action — light: confident midnight-fjord */
-  --btn: oklch(0.228 0.045 253.7);
-  --btn-hover: oklch(0.29 0.045 253.7);
-  --btn-fg: oklch(0.985 0.001 106.4);
-  --focus: oklch(0.228 0.045 253.7 / 0.18);
-
-  --accent: oklch(0.61 0.044 18.4);      /* canyon-clay-links, for small accents */
-  --good: oklch(0.56 0.13 155);
-  --bad: oklch(0.577 0.245 27.325);
-  --warn: oklch(0.68 0.15 65);
-
-  --shadow: 0 1px 2px oklch(0.228 0.045 253.7 / 0.04);
-  --radius: 12px;
-  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-
-  /* Datum chart palette (alpha.css --chart-1..5) */
-  --c1: hsl(12 76% 61%);
-  --c2: hsl(173 58% 39%);
-  --c3: hsl(197 37% 34%);
-  --c4: hsl(43 74% 66%);
-  --c5: hsl(27 87% 67%);
+/* datum-ui defines --radius sm..xl but not xs, which its shadcn base @apply's. */
+@theme {
+  --radius-xs: calc(var(--radius) - 6px);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: oklch(0.228 0.045 253.7);      /* midnight-fjord */
-    --panel: oklch(0.265 0.038 253.7);
-    --panel-2: oklch(0.31 0.036 253.7);
-    --field: oklch(0.245 0.04 253.7);
-    --border: oklch(1 0 0 / 0.08);
-    --text: oklch(0.973 0.001 106.4);    /* glacier-mist-700 */
-    --muted: oklch(0.7 0.015 250);
-
-    --btn: oklch(0.94 0.11 116.6);       /* aurora-moss */
-    --btn-hover: oklch(0.97 0.11 116.6);
-    --btn-fg: oklch(0.228 0.045 253.7);
-    --focus: oklch(0.94 0.11 116.6 / 0.28);
-
-    --accent: oklch(0.94 0.11 116.6);
-    --good: oklch(0.8 0.16 150);
-    --bad: oklch(0.704 0.191 22.216);
-    --warn: oklch(0.8 0.14 75);
-
-    --shadow: none;
-    --c1: hsl(220 70% 62%);
-    --c2: hsl(160 60% 52%);
-    --c3: hsl(30 80% 62%);
-    --c4: hsl(280 65% 68%);
-    --c5: hsl(340 75% 64%);
+/* shadcn convention: default every border to the theme token. */
+@layer base {
+  *,
+  ::after,
+  ::before {
+    border-color: var(--border);
   }
 }
 
-* { box-sizing: border-box; }
-
 body {
-  margin: 0;
-  background: var(--bg);
-  color: var(--text);
-  font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-  -webkit-font-smoothing: antialiased;
-}
-
-.wrap { max-width: 1080px; margin: 0 auto; padding: 40px 20px 72px; }
-
-header h1 { font-size: 21px; margin: 0 0 6px; letter-spacing: -0.02em; }
-header p { color: var(--muted); margin: 0 0 28px; max-width: 62ch; }
-
-.grid { display: grid; grid-template-columns: 340px 1fr; gap: 18px; align-items: start; }
-@media (max-width: 820px) { .grid { grid-template-columns: 1fr; } }
-
-.card {
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  box-shadow: var(--shadow);
-  padding: 20px;
-}
-.card h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 16px; font-weight: 600; }
-
-label { display: block; font-size: 12px; font-weight: 550; color: var(--text); margin: 16px 0 6px; }
-label:first-of-type { margin-top: 0; }
-
-input, select {
-  width: 100%;
-  padding: 9px 11px;
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  background: var(--field);
-  color: var(--text);
-  font: inherit;
-  transition: border-color 140ms ease-out, box-shadow 140ms ease-out;
-}
-input::placeholder { color: color-mix(in oklch, var(--muted) 75%, transparent); }
-input:focus, select:focus {
-  outline: none;
-  border-color: var(--btn);
-  box-shadow: 0 0 0 3px var(--focus);
-}
-
-.row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-
-button.run {
-  width: 100%;
-  margin-top: 20px;
-  padding: 11px;
-  border: 0;
-  border-radius: 10px;
-  background: var(--btn);
-  color: var(--btn-fg);
-  font-weight: 600;
-  font-size: 14px;
-  cursor: pointer;
-  transition: transform 140ms cubic-bezier(0.23, 1, 0.32, 1), background-color 140ms ease-out, opacity 140ms ease-out;
-}
-button.run:hover { background: var(--btn-hover); }
-button.run:active { transform: scale(0.975); }
-button.run:disabled { opacity: 0.5; cursor: default; }
-button.ghost {
-  margin-top: 8px; width: 100%; padding: 8px; border: 1px solid var(--border);
-  border-radius: 10px; background: transparent; color: var(--muted); cursor: pointer;
-  transition: transform 140ms cubic-bezier(0.23, 1, 0.32, 1), color 140ms ease-out, border-color 140ms ease-out;
-}
-button.ghost:hover { color: var(--text); border-color: color-mix(in oklch, var(--border) 60%, var(--text)); }
-button.ghost:active { transform: scale(0.985); }
-
-.hint { font-size: 11px; color: var(--muted); margin-top: 6px; line-height: 1.45; }
-
-.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 18px; }
-@media (max-width: 560px) { .stats { grid-template-columns: repeat(2, 1fr); } }
-.stat { background: var(--panel-2); border-radius: 9px; padding: 11px 13px; }
-.stat .n { font-size: 21px; font-weight: 650; letter-spacing: -0.02em; }
-.stat .l { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin-top: 2px; }
-
-.bar-row { display: flex; align-items: center; gap: 12px; margin: 9px 0; }
-.bar-label { width: 150px; font-family: var(--mono); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.bar-track { flex: 1; background: var(--panel-2); border-radius: 7px; height: 24px; overflow: hidden; }
-.bar-fill { height: 100%; border-radius: 7px; transition: width 320ms cubic-bezier(0.23, 1, 0.32, 1); min-width: 3px; }
-.bar-num { width: 96px; text-align: right; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
-
-.verdict { padding: 11px 13px; border-radius: 10px; margin-bottom: 18px; font-size: 13px; line-height: 1.45; }
-.verdict.good { background: color-mix(in oklch, var(--good) 12%, var(--panel)); color: color-mix(in oklch, var(--good) 55%, var(--text)); }
-.verdict.warn { background: color-mix(in oklch, var(--warn) 14%, var(--panel)); color: color-mix(in oklch, var(--warn) 55%, var(--text)); }
-
-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); font-variant-numeric: tabular-nums; }
-tr:last-child td { border-bottom: 0; }
-th { color: var(--muted); font-weight: 600; text-transform: uppercase; font-size: 10px; letter-spacing: 0.05em; }
-td.mono { font-family: var(--mono); }
-.pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
-.pill.ok { background: color-mix(in oklch, var(--good) 16%, transparent); color: color-mix(in oklch, var(--good) 70%, var(--text)); }
-.pill.err { background: color-mix(in oklch, var(--bad) 16%, transparent); color: color-mix(in oklch, var(--bad) 70%, var(--text)); }
-
-.empty { color: var(--muted); text-align: center; padding: 48px 0; font-size: 13px; }
-.scroll { max-height: 320px; overflow: auto; }
-.legend-dot { display: inline-block; width: 9px; height: 9px; border-radius: 3px; margin-right: 7px; vertical-align: middle; }
-
-@media (prefers-reduced-motion: reduce) {
-  * { transition-duration: 0.01ms !important; }
+  background: var(--background);
+  color: var(--foreground);
 }

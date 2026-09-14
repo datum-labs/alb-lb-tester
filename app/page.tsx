@@ -1,6 +1,18 @@
 'use client';
 
 import { useMemo, useRef, useState } from 'react';
+import { Card, CardContent, CardHeader, CardTitle } from '@datum-cloud/datum-ui/card';
+import { Button } from '@datum-cloud/datum-ui/button';
+import { Input } from '@datum-cloud/datum-ui/input';
+import { Label } from '@datum-cloud/datum-ui/label';
+import { Badge } from '@datum-cloud/datum-ui/badge';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@datum-cloud/datum-ui/select';
 
 type Result = {
   n: number;
@@ -14,14 +26,30 @@ type Result = {
 
 type KeyMode = 'none' | 'constant' | 'random' | 'sequential';
 
-// Datum chart palette (from datum-ui alpha.css --chart-1..5), cycled.
-const PALETTE = [
-  'var(--c1)', 'var(--c2)', 'var(--c3)', 'var(--c4)', 'var(--c5)',
+const CHART = [
+  'var(--chart-1)', 'var(--chart-2)', 'var(--chart-3)',
+  'var(--chart-4)', 'var(--chart-5)',
 ];
 
 function colorFor(id: string, order: string[]): string {
   const i = order.indexOf(id);
-  return PALETTE[(i < 0 ? 0 : i) % PALETTE.length];
+  return CHART[(i < 0 ? 0 : i) % CHART.length];
+}
+
+const KEY_MODES: { value: KeyMode; label: string }[] = [
+  { value: 'none', label: 'None — plain requests' },
+  { value: 'constant', label: 'Constant — same key (test stickiness)' },
+  { value: 'random', label: 'Random — new key per request (test spread)' },
+  { value: 'sequential', label: 'Sequential — key-0, key-1, …' },
+];
+
+function Stat({ n, label, tone }: { n: React.ReactNode; label: string; tone?: string }) {
+  return (
+    <div className="bg-muted rounded-md px-3 py-2.5">
+      <div className="text-xl font-semibold tracking-tight tabular-nums" style={tone ? { color: tone } : undefined}>{n}</div>
+      <div className="text-muted-foreground mt-0.5 text-[10.5px] font-medium uppercase tracking-wide">{label}</div>
+    </div>
+  );
 }
 
 export default function Page() {
@@ -133,132 +161,177 @@ export default function Page() {
   const maxCount = Math.max(1, ...[...summary.counts.values()]);
 
   return (
-    <div className="wrap">
-      <header>
-        <h1>ALB Load-Balancer Tester</h1>
-        <p>Fire traffic through a Datum HTTPProxy and watch which backend serves each request. Tests weighted backends and load-balancing algorithms.</p>
+    <div className="mx-auto max-w-5xl px-5 pb-16 pt-10">
+      <header className="mb-7">
+        <h1 className="text-xl font-semibold tracking-tight">ALB Load-Balancer Tester</h1>
+        <p className="text-muted-foreground mt-1.5 max-w-prose text-sm">
+          Fire traffic through a Datum HTTPProxy and watch which backend serves each request. Tests weighted backends and load-balancing algorithms.
+        </p>
       </header>
 
-      <div className="grid">
-        <div className="card">
-          <h2>Configuration</h2>
-
-          <label>Proxy base URL</label>
-          <input value={proxyUrl} onChange={(e) => setProxyUrl(e.target.value)} placeholder="https://your-alb.datumproxy.net" />
-          <div className="hint">Your HTTPProxy hostname. Its rule should point at two or more whoami backends.</div>
-
-          <label>Request path</label>
-          <input value={path} onChange={(e) => setPath(e.target.value)} />
-
-          <div className="row">
-            <div>
-              <label>Requests</label>
-              <input type="number" min={1} max={2000} value={count} onChange={(e) => setCount(+e.target.value)} />
+      <div className="grid items-start gap-4 md:grid-cols-[340px_1fr]">
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm">Configuration</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="space-y-1.5">
+              <Label htmlFor="proxy">Proxy base URL</Label>
+              <Input id="proxy" value={proxyUrl} onChange={(e) => setProxyUrl(e.target.value)} placeholder="https://your-alb.datumproxy.net" />
+              <p className="text-muted-foreground text-xs">Your HTTPProxy hostname. Its rule should point at two or more whoami backends.</p>
             </div>
-            <div>
-              <label>Concurrency</label>
-              <input type="number" min={1} max={50} value={concurrency} onChange={(e) => setConcurrency(+e.target.value)} />
+
+            <div className="space-y-1.5">
+              <Label htmlFor="path">Request path</Label>
+              <Input id="path" value={path} onChange={(e) => setPath(e.target.value)} />
             </div>
-          </div>
 
-          <label>Hash key mode</label>
-          <select value={keyMode} onChange={(e) => setKeyMode(e.target.value as KeyMode)}>
-            <option value="none">None — plain requests</option>
-            <option value="constant">Constant — same key every request (test stickiness)</option>
-            <option value="random">Random — new key per request (test hash spread)</option>
-            <option value="sequential">Sequential — key-0, key-1, …</option>
-          </select>
-          <div className="hint">
-            For a ConsistentHash-on-Header proxy: use Constant to confirm one backend, Random to confirm the hash spreads across backends.
-          </div>
-
-          {keyMode !== 'none' && (
-            <div className="row">
-              <div>
-                <label>Header name</label>
-                <input value={keyHeader} onChange={(e) => setKeyHeader(e.target.value)} />
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label htmlFor="count">Requests</Label>
+                <Input id="count" type="number" min={1} max={2000} value={count} onChange={(e) => setCount(+e.target.value)} />
               </div>
-              <div>
-                <label>Key value</label>
-                <input value={keyValue} onChange={(e) => setKeyValue(e.target.value)} disabled={keyMode === 'random'} />
+              <div className="space-y-1.5">
+                <Label htmlFor="conc">Concurrency</Label>
+                <Input id="conc" type="number" min={1} max={50} value={concurrency} onChange={(e) => setConcurrency(+e.target.value)} />
               </div>
             </div>
-          )}
 
-          <button className="run" onClick={run} disabled={running}>
-            {running ? `Running… ${done}/${count}` : 'Send traffic'}
-          </button>
-          {running && (
-            <button className="ghost" onClick={() => (cancel.current = true)}>Stop</button>
-          )}
-          {note && <div className="hint" style={{ color: 'var(--warn)', marginTop: 10 }}>{note}</div>}
-        </div>
+            <div className="space-y-1.5">
+              <Label>Hash key mode</Label>
+              <Select value={keyMode} onValueChange={(v) => setKeyMode(v as KeyMode)}>
+                <SelectTrigger className="w-full">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {KEY_MODES.map((m) => (
+                    <SelectItem key={m.value} value={m.value}>{m.label}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-muted-foreground text-xs">
+                For a ConsistentHash-on-Header proxy: use Constant to confirm one backend, Random to confirm the hash spreads across backends.
+              </p>
+            </div>
 
-        <div className="card">
-          <h2>Results</h2>
-
-          {results.length === 0 ? (
-            <div className="empty">No traffic yet. Configure a proxy URL and send requests.</div>
-          ) : (
-            <>
-              <div className="stats">
-                <div className="stat"><div className="n">{summary.total}</div><div className="l">Requests</div></div>
-                <div className="stat"><div className="n" style={{ color: 'var(--good)' }}>{summary.okCount}</div><div className="l">OK</div></div>
-                <div className="stat"><div className="n" style={{ color: summary.errCount ? 'var(--bad)' : undefined }}>{summary.errCount}</div><div className="l">Errors</div></div>
-                <div className="stat"><div className="n">{summary.uniqueBackends}</div><div className="l">Backends</div></div>
+            {keyMode !== 'none' && (
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-1.5">
+                  <Label htmlFor="hn">Header name</Label>
+                  <Input id="hn" value={keyHeader} onChange={(e) => setKeyHeader(e.target.value)} />
+                </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="hv">Key value</Label>
+                  <Input id="hv" value={keyValue} onChange={(e) => setKeyValue(e.target.value)} disabled={keyMode === 'random'} />
+                </div>
               </div>
+            )}
 
-              <div className="stats" style={{ gridTemplateColumns: 'repeat(3,1fr)' }}>
-                <div className="stat"><div className="n">{summary.p50.toFixed(0)}<span style={{ fontSize: 12, color: 'var(--muted)' }}>ms</span></div><div className="l">p50 latency</div></div>
-                <div className="stat"><div className="n">{summary.p95.toFixed(0)}<span style={{ fontSize: 12, color: 'var(--muted)' }}>ms</span></div><div className="l">p95 latency</div></div>
-                <div className="stat"><div className="n">{summary.max.toFixed(0)}<span style={{ fontSize: 12, color: 'var(--muted)' }}>ms</span></div><div className="l">max latency</div></div>
-              </div>
+            <Button block loading={running} onClick={run} disabled={running}>
+              {running ? `Running… ${done}/${count}` : 'Send traffic'}
+            </Button>
+            {running && (
+              <Button block theme="outline" onClick={() => (cancel.current = true)}>Stop</Button>
+            )}
+            {note && <p className="text-destructive text-xs">{note}</p>}
+          </CardContent>
+        </Card>
 
-              {stickyVerdict && (
-                <div className={`verdict ${stickyVerdict.good ? 'good' : 'warn'}`}>{stickyVerdict.text}</div>
-              )}
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-sm">Results</CardTitle>
+          </CardHeader>
+          <CardContent>
+            {results.length === 0 ? (
+              <div className="text-muted-foreground py-12 text-center text-sm">No traffic yet. Configure a proxy URL and send requests.</div>
+            ) : (
+              <div className="space-y-5">
+                <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
+                  <Stat n={summary.total} label="Requests" />
+                  <Stat n={summary.okCount} label="OK" tone="var(--chart-2)" />
+                  <Stat n={summary.errCount} label="Errors" tone={summary.errCount ? 'var(--destructive)' : undefined} />
+                  <Stat n={summary.uniqueBackends} label="Backends" />
+                </div>
 
-              <h2 style={{ marginTop: 4 }}>Distribution</h2>
-              {summary.order.map((id) => {
-                const c = summary.counts.get(id) ?? 0;
-                const share = (c / summary.total) * 100;
-                const isErr = !results.find((r) => r.backendId === id && r.ok);
-                return (
-                  <div className="bar-row" key={id}>
-                    <div className="bar-label" title={id}>{id}</div>
-                    <div className="bar-track">
-                      <div className="bar-fill" style={{ width: `${(c / maxCount) * 100}%`, background: isErr ? 'var(--bad)' : colorFor(id, summary.backends) }} />
-                    </div>
-                    <div className="bar-num">{c} · {share.toFixed(1)}%</div>
+                <div className="grid grid-cols-3 gap-2.5">
+                  <Stat n={<>{summary.p50.toFixed(0)}<span className="text-muted-foreground text-xs">ms</span></>} label="p50 latency" />
+                  <Stat n={<>{summary.p95.toFixed(0)}<span className="text-muted-foreground text-xs">ms</span></>} label="p95 latency" />
+                  <Stat n={<>{summary.max.toFixed(0)}<span className="text-muted-foreground text-xs">ms</span></>} label="max latency" />
+                </div>
+
+                {stickyVerdict && (
+                  <div
+                    className="rounded-md border px-3 py-2.5 text-sm"
+                    style={{
+                      borderColor: stickyVerdict.good ? 'var(--chart-2)' : 'var(--warning, var(--chart-5))',
+                      background: `color-mix(in oklch, ${stickyVerdict.good ? 'var(--chart-2)' : 'var(--chart-5)'} 12%, var(--card))`,
+                    }}
+                  >
+                    {stickyVerdict.text}
                   </div>
-                );
-              })}
+                )}
 
-              <h2 style={{ marginTop: 20 }}>Request log</h2>
-              <div className="scroll">
-                <table>
-                  <thead>
-                    <tr><th>#</th><th>Backend</th><th>Status</th><th>ms</th><th>Key</th></tr>
-                  </thead>
-                  <tbody>
-                    {results.slice(-200).reverse().map((r) => (
-                      <tr key={r.n}>
-                        <td>{r.n}</td>
-                        <td className="mono">
-                          {r.ok && <span className="legend-dot" style={{ background: colorFor(r.backendId, summary.backends) }} />}
-                          {r.backendId}
-                        </td>
-                        <td><span className={`pill ${r.ok ? 'ok' : 'err'}`}>{r.status || 'ERR'}</span></td>
-                        <td>{r.ms.toFixed(0)}</td>
-                        <td className="mono">{r.lbKey ?? '—'}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                <div>
+                  <div className="text-muted-foreground mb-3 text-[11px] font-semibold uppercase tracking-wider">Distribution</div>
+                  <div className="space-y-2">
+                    {summary.order.map((id) => {
+                      const c = summary.counts.get(id) ?? 0;
+                      const share = (c / summary.total) * 100;
+                      const isErr = !results.find((r) => r.backendId === id && r.ok);
+                      return (
+                        <div className="flex items-center gap-3" key={id}>
+                          <div className="w-[150px] truncate font-mono text-xs" title={id}>{id}</div>
+                          <div className="bg-muted h-6 flex-1 overflow-hidden rounded">
+                            <div
+                              className="h-full rounded transition-[width] duration-300 ease-out"
+                              style={{ width: `${(c / maxCount) * 100}%`, minWidth: 3, background: isErr ? 'var(--destructive)' : colorFor(id, summary.backends) }}
+                            />
+                          </div>
+                          <div className="text-muted-foreground w-24 text-right text-xs tabular-nums">{c} · {share.toFixed(1)}%</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                <div>
+                  <div className="text-muted-foreground mb-2 text-[11px] font-semibold uppercase tracking-wider">Request log</div>
+                  <div className="max-h-80 overflow-auto">
+                    <table className="w-full text-xs">
+                      <thead>
+                        <tr className="text-muted-foreground text-left">
+                          <th className="border-b py-1.5 pr-2 font-semibold uppercase">#</th>
+                          <th className="border-b px-2 py-1.5 font-semibold uppercase">Backend</th>
+                          <th className="border-b px-2 py-1.5 font-semibold uppercase">Status</th>
+                          <th className="border-b px-2 py-1.5 font-semibold uppercase">ms</th>
+                          <th className="border-b px-2 py-1.5 font-semibold uppercase">Key</th>
+                        </tr>
+                      </thead>
+                      <tbody className="tabular-nums">
+                        {results.slice(-200).reverse().map((r) => (
+                          <tr key={r.n}>
+                            <td className="border-b py-1.5 pr-2">{r.n}</td>
+                            <td className="border-b px-2 py-1.5 font-mono">
+                              {r.ok && (
+                                <span className="mr-1.5 inline-block size-2.5 rounded-[3px] align-middle" style={{ background: colorFor(r.backendId, summary.backends) }} />
+                              )}
+                              {r.backendId}
+                            </td>
+                            <td className="border-b px-2 py-1.5">
+                              <Badge type={r.ok ? 'success' : 'danger'}>{r.status || 'ERR'}</Badge>
+                            </td>
+                            <td className="border-b px-2 py-1.5">{r.ms.toFixed(0)}</td>
+                            <td className="border-b px-2 py-1.5 font-mono">{r.lbKey ?? '—'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
               </div>
-            </>
-          )}
-        </div>
+            )}
+          </CardContent>
+        </Card>
       </div>
     </div>
   );

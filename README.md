@@ -65,7 +65,7 @@ Open the dashboard, enter your **proxy hostname** (e.g. `https://your-alb.datump
 
 ## Local development
 
-Built with Next.js 16 and React 19.
+Built with Next.js 16, React 19, Tailwind v4, and the @datum-cloud/datum-ui design system.
 
 ```bash
 bun install
