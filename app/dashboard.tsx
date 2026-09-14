@@ -586,7 +586,7 @@ function WafTab({ base, path, item, container }: { base: string; path: string; i
                         <Td>{r.status || 'ERR'}</Td>
                         <Td>
                           {r.kind === 'attack'
-                            ? <Badge type={r.blocked ? 'success' : 'danger'}>{r.blocked ? 'blocked' : 'passed'}</Badge>
+                            ? <Badge type={r.blocked ? 'info' : 'danger'}>{r.blocked ? 'blocked' : 'passed'}</Badge>
                             : <Badge type={r.blocked ? 'danger' : 'success'}>{r.blocked ? 'blocked (!)' : 'allowed'}</Badge>}
                         </Td>
                       </tr>
