@@ -529,7 +529,13 @@ function WafTab({ base, path, item, container }: { base: string; path: string; i
     ];
     for (const j of jobs) {
       let status = 0;
-      try { const res = await fetch(`${j.url}${j.url.includes('?') ? '&' : '?'}_=${Math.random()}`, { cache: 'no-store' }); status = res.status; } catch { status = 0; }
+      // Probe server-side: a WAF 403 (or a plain HTML 200) carries no CORS
+      // headers, so a direct browser fetch cannot read its status.
+      try {
+        const res = await fetch(`/api/probe?url=${encodeURIComponent(j.url)}`, { cache: 'no-store' });
+        const data = await res.json();
+        status = typeof data.status === 'number' ? data.status : 0;
+      } catch { status = 0; }
       out.push({ kind: j.kind, label: j.label, status, blocked: status === 403 });
       setRows(out.slice());
     }
