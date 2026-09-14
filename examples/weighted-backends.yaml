@@ -1,0 +1,14 @@
+# PR #453 — N weighted backends per rule.
+# Split traffic ~80/20 across two whoami deployments. Send traffic from the
+# dashboard and confirm the distribution bars sit near 80% / 20%.
+apiVersion: networking.datumapis.com/v1alpha
+kind: HTTPProxy
+metadata:
+  name: lb-tester-weighted
+spec:
+  rules:
+    - backends:
+        - endpoint: https://alb-tester-a.vercel.app
+          weight: 80
+        - endpoint: https://alb-tester-b.vercel.app
+          weight: 20

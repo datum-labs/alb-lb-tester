@@ -1,0 +1,18 @@
+# PR #455 — ConsistentHash on the client source IP.
+# From one machine every request shares a source IP, so all traffic sticks to
+# one backend (that IS the correct result). To see the hash spread you need
+# multiple client IPs.
+apiVersion: networking.datumapis.com/v1alpha
+kind: HTTPProxy
+metadata:
+  name: lb-tester-hash-sourceip
+spec:
+  loadBalancer:
+    type: ConsistentHash
+    consistentHash:
+      type: SourceIP
+  rules:
+    - backends:
+        - endpoint: https://alb-tester-a.vercel.app
+        - endpoint: https://alb-tester-b.vercel.app
+        - endpoint: https://alb-tester-c.vercel.app

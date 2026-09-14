@@ -1,0 +1,15 @@
+# PR #455 — load-balancing algorithm. RoundRobin cycles evenly across backends.
+# With equal (default) weights, expect a near-even split. Random and
+# LeastRequest are drop-in swaps for spec.loadBalancer.type.
+apiVersion: networking.datumapis.com/v1alpha
+kind: HTTPProxy
+metadata:
+  name: lb-tester-round-robin
+spec:
+  loadBalancer:
+    type: RoundRobin        # or Random, or LeastRequest
+  rules:
+    - backends:
+        - endpoint: https://alb-tester-a.vercel.app
+        - endpoint: https://alb-tester-b.vercel.app
+        - endpoint: https://alb-tester-c.vercel.app

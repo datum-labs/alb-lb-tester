@@ -1,0 +1,19 @@
+# PR #455 — ConsistentHash on a request header.
+# In the dashboard: Constant key mode -> every request with the same
+# x-lb-key must hit ONE backend (sticky). Random key mode -> keys spread
+# across backends. The header name here must match the dashboard's.
+apiVersion: networking.datumapis.com/v1alpha
+kind: HTTPProxy
+metadata:
+  name: lb-tester-hash-header
+spec:
+  loadBalancer:
+    type: ConsistentHash
+    consistentHash:
+      type: Header
+      header: x-lb-key
+  rules:
+    - backends:
+        - endpoint: https://alb-tester-a.vercel.app
+        - endpoint: https://alb-tester-b.vercel.app
+        - endpoint: https://alb-tester-c.vercel.app
