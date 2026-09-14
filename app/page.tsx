@@ -37,7 +37,7 @@ export default function Page() {
           </p>
         </div>
         <div
-          className="bg-card flex shrink-0 items-center gap-2 rounded-full border py-1.5 pl-2.5 pr-3.5 text-xs shadow-sm"
+          className="bg-muted flex shrink-0 items-center gap-2 rounded-full py-1.5 pl-2.5 pr-3.5 text-xs"
           title="The BACKEND_ID this deployment was given. It is the origin the dashboard runs on, not necessarily the one your proxy routes to."
         >
           <span className="relative flex size-2.5 items-center justify-center">
