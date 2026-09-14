@@ -57,6 +57,23 @@ Open the dashboard, enter your **proxy hostname** (e.g. `https://your-alb.datump
 | ConsistentHash on header, spread | Same manifest, key mode **Random** | Requests spread across backends |
 | ConsistentHash on source IP | SourceIP manifest, key mode None | All requests stick to one backend (one client IP) |
 
+## Features
+
+The dashboard has three tabs, all driven by the shared proxy URL at the top.
+
+**Load balancing** — fire a burst (or a continuous **Live** stream with a rolling req/s meter) and see:
+- Distribution bars per backend, with **expected-vs-observed** deltas when you enter the weights you configured
+- A **sequence strip** showing which backend served each request in order, so RoundRobin vs Random vs LeastRequest is visible at a glance
+- A **per-backend table** with request share and p50/p95 latency
+- Sticky-session verdict for ConsistentHash, and **CSV export** of the run
+
+**Headers & redirect** — inspects the target from the server (past browser CORS) and reports:
+- The **Host** the origin actually received, flagged when the proxy overrode it
+- Whether **HSTS** is set, and the full request/response header dumps
+- Whether **http redirects to https**
+
+**WAF probes** — sends a set of XSS, SQLi, command-injection and traversal payloads plus benign requests, and reports the block rate, any false positives, and a per-payload table.
+
 ## Notes
 
 - The echo endpoint sends permissive CORS headers so the browser can read responses through the proxy.
