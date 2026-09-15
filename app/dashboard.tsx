@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Activity, useEffect, useMemo, useRef, useState } from 'react';
 import { motion, useReducedMotion, useSpring, useTransform, type Variants } from 'motion/react';
 import { Card, CardContent, CardHeader, CardTitle } from '@datum-cloud/datum-ui/card';
 import { Button } from '@datum-cloud/datum-ui/button';
@@ -104,14 +104,11 @@ export function Dashboard() {
     ? { hidden: { opacity: 0 }, show: { opacity: 1 } }
     : { hidden: { opacity: 0, y: 8 }, show: { opacity: 1, y: 0, transition: { duration: 0.28, ease: EASE } } };
   const container = { hidden: {}, show: { transition: { staggerChildren: 0.04 } } };
-  const panel = reduce
-    ? { initial: { opacity: 0 }, animate: { opacity: 1 } }
-    : { initial: { opacity: 0, y: 6 }, animate: { opacity: 1, y: 0 } };
 
   return (
     <div className="space-y-4">
       <Card>
-        <CardContent className="grid gap-3 py-4 sm:grid-cols-[1fr_240px]">
+        <CardContent className="grid gap-3 sm:grid-cols-[1fr_240px]">
           <div className="space-y-1.5">
             <Label htmlFor="proxy">Proxy base URL</Label>
             <Input id="proxy" value={proxyUrl} onChange={(e) => setProxyUrl(e.target.value)} placeholder="https://your-alb.datumproxy.net" />
@@ -130,22 +127,24 @@ export function Dashboard() {
           <TabsTrigger value="waf">WAF probes</TabsTrigger>
         </TabsList>
 
-        <TabsContent value="load" className="mt-4">
-          <motion.div {...panel} transition={{ duration: 0.2, ease: EASE }}>
+        {/* forceMount keeps all panels in the DOM; <Activity> preserves each
+            tab's state and pauses the hidden panels' effects. */}
+        <TabsContent value="load" forceMount className="mt-4 data-[state=inactive]:hidden">
+          <Activity mode={tab === 'load' ? 'visible' : 'hidden'}>
             <LoadTab base={base} target={target} item={item} container={container} reduce={!!reduce} />
-          </motion.div>
+          </Activity>
         </TabsContent>
 
-        <TabsContent value="inspect" className="mt-4">
-          <motion.div {...panel} transition={{ duration: 0.2, ease: EASE }}>
+        <TabsContent value="inspect" forceMount className="mt-4 data-[state=inactive]:hidden">
+          <Activity mode={tab === 'inspect' ? 'visible' : 'hidden'}>
             <InspectTab base={base} target={target} item={item} container={container} />
-          </motion.div>
+          </Activity>
         </TabsContent>
 
-        <TabsContent value="waf" className="mt-4">
-          <motion.div {...panel} transition={{ duration: 0.2, ease: EASE }}>
+        <TabsContent value="waf" forceMount className="mt-4 data-[state=inactive]:hidden">
+          <Activity mode={tab === 'waf' ? 'visible' : 'hidden'}>
             <WafTab base={base} path={path} item={item} container={container} />
-          </motion.div>
+          </Activity>
         </TabsContent>
       </Tabs>
     </div>
