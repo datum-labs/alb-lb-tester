@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { motion, useReducedMotion, useSpring, useTransform, type Variants } from 'motion/react';
 import { Card, CardContent, CardHeader, CardTitle } from '@datum-cloud/datum-ui/card';
 import { Button } from '@datum-cloud/datum-ui/button';
@@ -75,11 +75,27 @@ function download(name: string, text: string) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+type TabId = 'load' | 'inspect' | 'waf';
+const TAB_STORAGE_KEY = 'alb-tester:tab';
+
 export function Dashboard() {
   const [proxyUrl, setProxyUrl] = useState('');
   const [path, setPath] = useState('/api/whoami');
-  const [tab, setTab] = useState('load');
+  const [tab, setTab] = useState<TabId>('load');
   const reduce = useReducedMotion();
+
+  // Restore the last-used tab, then keep it in sync across reloads.
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(TAB_STORAGE_KEY);
+      if (saved === 'load' || saved === 'inspect' || saved === 'waf') setTab(saved);
+    } catch {}
+  }, []);
+  useEffect(() => {
+    try {
+      localStorage.setItem(TAB_STORAGE_KEY, tab);
+    } catch {}
+  }, [tab]);
 
   const base = useMemo(() => proxyUrl.trim().replace(/\/+$/, ''), [proxyUrl]);
   const target = (p = path) => `${base}${p.startsWith('/') ? '' : '/'}${p}`;
@@ -107,8 +123,8 @@ export function Dashboard() {
         </CardContent>
       </Card>
 
-      <Tabs value={tab} onValueChange={setTab}>
-        <TabsList>
+      <Tabs value={tab} onValueChange={(v) => setTab(v as TabId)}>
+        <TabsList variant="line">
           <TabsTrigger value="load">Load balancing</TabsTrigger>
           <TabsTrigger value="inspect">Headers &amp; redirect</TabsTrigger>
           <TabsTrigger value="waf">WAF probes</TabsTrigger>
