@@ -76,15 +76,31 @@ The dashboard has four tabs, all driven by the shared proxy URL at the top.
 
 **WAF probes** — sends a set of XSS, SQLi, command-injection and traversal payloads plus benign requests, and reports the block rate, any false positives, and a per-payload table.
 
-**Health checks** — makes one backend fail and checks outlier detection. **Detect** lists the backends behind the proxy; pick one to fail. The run sends a steady stream in three phases: *baseline* (nothing fails), *failing* (requests carry `?fail=<backend>`, so only that backend returns 5xx), and *recovery*. It reports:
-- When the target was **ejected** (3 seconds with no traffic to it) and how many 5xx it returned first
+**Health checks** — makes one backend, or one instance of a backend, fail and checks outlier detection. **Detect** lists the backends behind the proxy and, for any backend answering from more than one instance, its instances; pick one to fail. The run sends a steady stream in three phases: *baseline* (nothing fails), *failing* (requests carry `?fail=<backend or instance>`, so only that one returns 5xx), and *recovery*. It reports:
+- When the target was **ejected** (no traffic to it for a stretch in which, at its baseline share, it should have had several requests) and how many 5xx it returned first
 - How often the proxy **retried** it while it was still failing, each time an ejection period ended
 - How long after the failures stopped it was **re-admitted**
-- A per-second timeline of which backend answered, with target 5xx and proxy-generated 5xx marked, and each backend's share per phase
+- A per-second timeline of which backend or instance answered, with target 5xx and proxy-generated 5xx marked, and each one's share per phase
 
-Requests go through the server-side probe so a 503 the proxy generates itself (no CORS headers) is still counted, and told apart from the backend's own 503.
+Requests go through the server-side probe so a 503 the proxy generates itself (no CORS headers) is still counted, and told apart from the backend's own 503. A run that falls well below the requested rate is reported as inconclusive unless it still has enough failures to decide.
 
-If the target is never ejected, check that outlier detection is on. Backends on different hostnames each get their own upstream; when one of those has a single endpoint, ejecting it leaves no healthy host, and the proxy may keep routing to it.
+### What outlier detection does, and how to test it
+
+Outlier detection ejects **endpoints within a backend**. It doesn't move traffic between backends: a backend whose every endpoint fails keeps its weighted share. So failing a whole Vercel backend (one app behind shared anycast IPs) will always report *not ejected*, and that's the expected result.
+
+To see an ejection, fail one endpoint of a backend that has several. Run the tester as a **Datum Compute workload with 3 instances** and add it to the load balancer as a Datum compute backend (see `examples/health-check-compute.yaml`). Three instances rather than two: with max ejected at 50% one of three can go, and the other two keep the backend well above the proxy's panic threshold, where it would ignore health and route to every endpoint.
+
+## Run on Datum Compute
+
+Datum Compute runs unikernels, so the image is built with `datumctl compute build` from `Dockerfile.datum` rather than `docker build`. The final stage is distroless Node (the binary and the shared libraries it links against, no shell) running Next's standalone server; `--analyze` checks the entrypoint and its libraries before packaging.
+
+The **Compute image** workflow builds it on every push to `main` that touches the app and publishes `ghcr.io/mattdjenkinson/alb-lb-tester:latest` and `:sha-<commit>`. To build by hand, with Docker running and a GHCR login that can write packages:
+
+```bash
+datumctl compute build --analyze --push --output ghcr.io/<you>/alb-lb-tester:latest .
+```
+
+Then create a Compute workload from the image with **3 instances**, port `http` on **3000**, and environment `BACKEND_ID=compute`. Each instance picks its own id at start; set `INSTANCE_ID` to name them yourself. The repository is private, so its package is too: either make the `alb-lb-tester` package public in its GitHub package settings, or give the workload an image pull secret.
 
 ## Notes
 

@@ -665,6 +665,24 @@ const PHASE_TINT: Record<Phase, string> = {
 };
 const PHASE_LABEL: Record<Phase, string> = { baseline: 'Baseline', failing: 'Failing', recovery: 'Recovery' };
 
+/**
+ * A target is a backend id, or "<backend>·<instance>" for one instance of a
+ * backend with several. Failing a whole backend is the case outlier detection
+ * can't help with; failing one instance is the case it's for.
+ */
+const INSTANCE_SEP = '·';
+function splitTarget(target: string): { backend: string; instance: string | null } {
+  const [backend, instance] = target.split(INSTANCE_SEP);
+  return { backend, instance: instance ?? null };
+}
+/** The unit a response counts under for this target: its instance within the target's backend, else its backend. */
+function unitFor(target: string, backendId: string | null, instanceId: string | null): string | null {
+  const { backend, instance } = splitTarget(target);
+  if (!backendId) return null;
+  if (instance && backendId === backend && instanceId) return `${backendId}${INSTANCE_SEP}${instanceId}`;
+  return backendId;
+}
+
 function HealthTab({
   base, target, item, container,
 }: { base: string; target: (p?: string) => string; item: Variants; container: Variants }) {
@@ -674,7 +692,7 @@ function HealthTab({
   const [baselineS, setBaselineS] = useState(10);
   const [failingS, setFailingS] = useState(40);
   const [recoveryS, setRecoveryS] = useState(70);
-  const [detected, setDetected] = useState<string[]>([]);
+  const [detected, setDetected] = useState<{ backends: string[]; instances: string[] }>({ backends: [], instances: [] });
   const [detecting, setDetecting] = useState(false);
   const [running, setRunning] = useState(false);
   const [elapsed, setElapsed] = useState(0);
@@ -691,16 +709,22 @@ function HealthTab({
     try {
       const res = await fetch(`/api/probe?url=${encodeURIComponent(url)}`, { cache: 'no-store' });
       const data = await res.json();
-      return { status: typeof data.status === 'number' ? data.status : 0, backendId: (data.backendId as string | null) ?? null };
+      return {
+        status: typeof data.status === 'number' ? data.status : 0,
+        backendId: (data.backendId as string | null) ?? null,
+        instanceId: (data.instanceId as string | null) ?? null,
+      };
     } catch {
-      return { status: 0, backendId: null };
+      return { status: 0, backendId: null, instanceId: null };
     }
   }
 
   function requestUrl(n: number, failing: boolean, id: string) {
     const url = new URL(target());
     if (failing) {
-      url.searchParams.set('fail', id);
+      // The origin matches ?fail= against its backend id or its instance id.
+      const { backend, instance } = splitTarget(id);
+      url.searchParams.set('fail', instance ?? backend);
       url.searchParams.set('failStatus', String(failStatus));
     }
     url.searchParams.set('_', String(n));
@@ -710,18 +734,28 @@ function HealthTab({
   async function detect() {
     if (!base) { setNote('Enter the proxy base URL above first.'); return; }
     setDetecting(true); setNote(null);
-    const results = await Promise.all(Array.from({ length: 20 }, (_, n) => probe(requestUrl(n, false, ''))));
-    const ids = [...new Set(results.map((r) => r.backendId).filter((id): id is string => !!id))].sort();
-    setDetected(ids);
-    if (!ids.length) setNote('No backend answered. Check the proxy URL and path.');
-    else if (!failTarget) setFailTarget(ids[ids.length - 1]);
+    // Enough requests to see each instance of a backend with a few of them.
+    const results = await Promise.all(Array.from({ length: 40 }, (_, n) => probe(requestUrl(n, false, ''))));
+    const backends = [...new Set(results.map((r) => r.backendId).filter((id): id is string => !!id))].sort();
+    const instancesBy = new Map<string, Set<string>>();
+    for (const r of results) {
+      if (!r.backendId || !r.instanceId) continue;
+      instancesBy.set(r.backendId, (instancesBy.get(r.backendId) ?? new Set()).add(r.instanceId));
+    }
+    // Only a backend with more than one instance has an endpoint to eject.
+    const instances = [...instancesBy.entries()]
+      .filter(([, ids]) => ids.size > 1)
+      .flatMap(([backend, ids]) => [...ids].sort().map((id) => `${backend}${INSTANCE_SEP}${id}`));
+    setDetected({ backends, instances });
+    if (!backends.length) setNote('No backend answered. Check the proxy URL and path.');
+    else if (!failTarget) setFailTarget(instances[0] ?? backends[backends.length - 1]);
     setDetecting(false);
   }
 
   async function run() {
     if (!base) { setNote('Enter the proxy base URL above first.'); return; }
     const id = failTarget.trim();
-    if (!id) { setNote('Choose the backend to fail. Use Detect to list them.'); return; }
+    if (!id) { setNote('Choose a backend or instance to fail. Use Detect to list them.'); return; }
     const rate = Math.max(1, Math.min(50, Math.floor(rps)));
     const b = Math.max(1, Math.floor(baselineS));
     const f = Math.max(1, Math.floor(failingS));
@@ -755,7 +789,12 @@ function HealthTab({
         const phase: Phase = t < b * 1000 ? 'baseline' : t < (b + f) * 1000 ? 'failing' : 'recovery';
         const index = n++;
         const job = probe(requestUrl(index, phase === 'failing', id)).then((res) => {
-          store.current.push({ n: index, t, phase, backendId: res.backendId, status: res.status });
+          store.current.push({
+            n: index, t, phase,
+            backendId: res.backendId, instanceId: res.instanceId,
+            unit: unitFor(id, res.backendId, res.instanceId),
+            status: res.status,
+          });
         });
         inflight.add(job);
         void job.finally(() => inflight.delete(job));
@@ -780,7 +819,7 @@ function HealthTab({
   );
   const backends = useMemo(() => {
     const ids = new Set<string>();
-    for (const s of samples) if (s.backendId) ids.add(s.backendId);
+    for (const s of samples) if (s.unit) ids.add(s.unit);
     return [...ids].sort();
   }, [samples]);
   const colorFor = (id: string) => CHART[Math.max(0, backends.indexOf(id)) % CHART.length];
@@ -793,7 +832,7 @@ function HealthTab({
       id,
       counts: phases.map((phase) => {
         const inPhase = samples.filter((s) => s.phase === phase);
-        const mine = inPhase.filter((s) => s.backendId === id);
+        const mine = inPhase.filter((s) => s.unit === id);
         return { count: mine.length, share: inPhase.length ? (mine.length / inPhase.length) * 100 : 0 };
       }),
     }));
@@ -845,24 +884,37 @@ function HealthTab({
         <CardHeader><CardTitle className="text-sm">Health check test</CardTitle></CardHeader>
         <CardContent className="space-y-4">
           <p className="text-muted-foreground text-xs">
-            Makes one backend answer 5xx for a while, then watches whether the proxy stops sending it traffic (ejection) and when it comes back (re-admission). Needs outlier detection on the load balancer.
+            Makes one backend, or one instance of a backend, answer 5xx for a while, then watches whether the proxy stops sending it traffic (ejection) and when it comes back (re-admission). Needs outlier detection on the load balancer.
+          </p>
+          <p className="text-muted-foreground text-xs">
+            Outlier detection ejects endpoints within a backend, so to see it work, fail one <span className="text-foreground font-medium">instance</span> of a backend that has several (a Datum Compute workload with 3 instances). Failing a whole backend shows it keeping its weighted share.
           </p>
 
           <div className="space-y-1.5">
-            <Label htmlFor="hc-target">Backend to fail</Label>
+            <Label htmlFor="hc-target">Backend or instance to fail</Label>
             <div className="flex gap-2">
-              <Input id="hc-target" value={failTarget} onChange={(e) => setFailTarget(e.target.value)} placeholder="backend-b" className="flex-1" disabled={running} />
+              <Input id="hc-target" value={failTarget} onChange={(e) => setFailTarget(e.target.value)} placeholder="backend-b or compute·ab12cd" className="flex-1" disabled={running} />
               <Button theme="outline" loading={detecting} onClick={detect} disabled={running}>Detect</Button>
             </div>
-            {detected.length > 0 && (
-              <div className="flex flex-wrap gap-1.5 pt-1">
-                {detected.map((id) => (
-                  <button key={id} type="button" disabled={running} onClick={() => setFailTarget(id)}
-                    className="rounded-md border px-2 py-0.5 font-mono text-xs transition-colors disabled:opacity-50"
-                    style={failTarget === id ? { borderColor: 'var(--destructive)', background: 'color-mix(in oklch, var(--destructive) 12%, var(--card))' } : undefined}>
-                    {id}
-                  </button>
-                ))}
+            {detected.backends.length > 0 && (
+              <div className="space-y-1.5 pt-1">
+                {([['Backends', detected.backends], ['Instances', detected.instances]] as const).map(([label, ids]) =>
+                  ids.length === 0 ? null : (
+                    <div key={label} className="flex flex-wrap items-center gap-1.5">
+                      <span className="text-muted-foreground w-16 text-[11px]">{label}</span>
+                      {ids.map((id) => (
+                        <button key={id} type="button" disabled={running} onClick={() => setFailTarget(id)}
+                          className="rounded-md border px-2 py-0.5 font-mono text-xs transition-colors disabled:opacity-50"
+                          style={failTarget === id ? { borderColor: 'var(--destructive)', background: 'color-mix(in oklch, var(--destructive) 12%, var(--card))' } : undefined}>
+                          {id}
+                        </button>
+                      ))}
+                    </div>
+                  ),
+                )}
+                {detected.instances.length === 0 && (
+                  <p className="text-muted-foreground text-[11px]">No backend answered from more than one instance, so there&rsquo;s no single endpoint to fail.</p>
+                )}
               </div>
             )}
           </div>
@@ -910,7 +962,7 @@ function HealthTab({
           )}
           {samples.length > 0 && !running && (
             <Button block theme="link" onClick={() => download('alb-health-results.csv',
-              'n,t_ms,phase,backendId,status\n' + samples.map((s) => `${s.n},${s.t.toFixed(0)},${s.phase},${s.backendId ?? ''},${s.status}`).join('\n'))}>
+              'n,t_ms,phase,backendId,instanceId,status\n' + samples.map((s) => `${s.n},${s.t.toFixed(0)},${s.phase},${s.backendId ?? ''},${s.instanceId ?? ''},${s.status}`).join('\n'))}>
               Export CSV
             </Button>
           )}
@@ -950,9 +1002,18 @@ function HealthTab({
                   <p>{summary.text}</p>
                   {summary.tone === 'bad' && verdict && verdict.baselineToTarget > 0 && (
                     <ul className="text-muted-foreground list-disc space-y-0.5 pl-4 text-xs">
-                      <li>Outlier detection is off, or its 5xx threshold is higher than the failures this run sent.</li>
-                      <li>Every edge proxy counts consecutive 5xx on its own. Spread across several proxies, no single one may have seen enough in a row; a higher rate or longer failing phase helps.</li>
-                      <li>Each backend on its own hostname is its own upstream. With a single endpoint, ejecting it leaves no healthy host, so the proxy may keep routing to it anyway.</li>
+                      {splitTarget(cfg.target).instance === null ? (
+                        // Failing a whole backend: its share holding up is the expected result.
+                        <li>
+                          This run failed a whole backend. Outlier detection ejects endpoints <em>within</em> a backend and doesn&rsquo;t move traffic between backends, so a backend whose every endpoint fails keeps its weighted share. Fail one instance of a backend with several to test ejection.
+                        </li>
+                      ) : (
+                        <>
+                          <li>Outlier detection is off, or its 5xx threshold is higher than the failures this run sent.</li>
+                          <li>Every edge proxy counts consecutive 5xx on its own. Spread across several proxies, no single one may have seen enough in a row; a higher rate or longer failing phase helps.</li>
+                          <li>With max ejected at 50%, a backend with two instances can eject one; with fewer healthy than the proxy&rsquo;s panic threshold it routes to all of them anyway. Three or more instances avoids both.</li>
+                        </>
+                      )}
                     </ul>
                   )}
                   {verdict && verdict.proxy5xx > 0 && (

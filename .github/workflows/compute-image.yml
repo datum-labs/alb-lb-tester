@@ -1,0 +1,57 @@
+name: Compute image
+
+# Builds the tester for Datum Compute and publishes it to GHCR, so it can run
+# as a multi-instance workload: the backend shape the Health checks tab needs
+# to see outlier detection eject a single endpoint.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'app/**'
+      - 'Dockerfile.datum'
+      - 'next.config.mjs'
+      - 'package.json'
+      - 'bun.lock'
+      - '.github/workflows/compute-image.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: compute-image
+  cancel-in-progress: true
+
+env:
+  DATUMCTL_VERSION: 0.20.0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install datumctl
+        run: |
+          curl -fsSL -o datumctl.deb \
+            "https://github.com/datum-cloud/datumctl/releases/download/v${DATUMCTL_VERSION}/datumctl_${DATUMCTL_VERSION}_linux_amd64.deb"
+          sudo dpkg -i datumctl.deb
+
+      # --analyze fails the build on the two problems that otherwise only show
+      # up after boot: an entrypoint that isn't x86_64, and a shared library
+      # missing from the final stage.
+      - name: Build and push
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          datumctl compute build --analyze --push --output "${image}:sha-${GITHUB_SHA::12}" .
+          datumctl compute build --push --output "${image}:latest" .
+          echo "Pushed ${image}:sha-${GITHUB_SHA::12} and ${image}:latest" >> "$GITHUB_STEP_SUMMARY"

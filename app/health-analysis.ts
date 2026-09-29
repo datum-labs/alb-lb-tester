@@ -21,6 +21,13 @@ export type HealthSample = {
   phase: Phase;
   /** Which of our origins answered; null when the proxy answered itself. */
   backendId: string | null;
+  /** Which instance of that origin answered, when it said. */
+  instanceId: string | null;
+  /**
+   * What the test tracks this sample under: the backend id, or for the
+   * target's backend when one instance is failed, "<backend>·<instance>".
+   */
+  unit: string | null;
   status: number;
 };
 
@@ -31,7 +38,7 @@ export function outcomeOf(sample: HealthSample, target: string): Outcome {
   if (sample.status >= 200 && sample.status < 400) return 'ok';
   if (sample.status >= 500) {
     if (!sample.backendId) return 'proxy-5xx';
-    return sample.backendId === target ? 'target-5xx' : 'backend-5xx';
+    return sample.unit === target ? 'target-5xx' : 'backend-5xx';
   }
   return 'other';
 }
@@ -39,7 +46,7 @@ export function outcomeOf(sample: HealthSample, target: string): Outcome {
 export type Bucket = {
   second: number;
   phase: Phase;
-  /** 2xx/3xx responses per backend. */
+  /** 2xx/3xx responses per unit (backend, or instance of the target's backend). */
   ok: Map<string, number>;
   target5xx: number;
   backend5xx: number;
@@ -78,10 +85,10 @@ export function bucketize(
     const bucket = buckets[Math.floor(sample.t / 1000)];
     if (!bucket) continue;
     bucket.total += 1;
-    if (sample.backendId === target) bucket.toTarget += 1;
+    if (sample.unit === target) bucket.toTarget += 1;
     switch (outcomeOf(sample, target)) {
       case 'ok':
-        bucket.ok.set(sample.backendId ?? 'unknown', (bucket.ok.get(sample.backendId ?? 'unknown') ?? 0) + 1);
+        bucket.ok.set(sample.unit ?? 'unknown', (bucket.ok.get(sample.unit ?? 'unknown') ?? 0) + 1);
         break;
       case 'target-5xx':
         bucket.target5xx += 1;
@@ -160,8 +167,8 @@ export function analyse(
   const recoveryS = Math.max(1, buckets.length - failEnd);
 
   const baseline = samples.filter((s) => s.phase === 'baseline');
-  const baselineBackends = [...new Set(baseline.map((s) => s.backendId).filter((id): id is string => !!id))];
-  const baselineToTarget = baseline.filter((s) => s.backendId === target).length;
+  const baselineBackends = [...new Set(baseline.map((s) => s.unit).filter((id): id is string => !!id))];
+  const baselineToTarget = baseline.filter((s) => s.unit === target).length;
   const baselineShare = baseline.length ? baselineToTarget / baseline.length : 0;
   const failing = samples.filter((s) => s.phase === 'failing');
   const recovery = samples.filter((s) => s.phase === 'recovery');
@@ -209,7 +216,7 @@ export function analyse(
 
   const readmit = firstEjection
     ? samples
-        .filter((s) => s.phase === 'recovery' && s.backendId === target && outcomeOf(s, target) === 'ok')
+        .filter((s) => s.phase === 'recovery' && s.unit === target && outcomeOf(s, target) === 'ok')
         .sort((a, b) => a.t - b.t)[0]
     : undefined;
 
@@ -223,14 +230,14 @@ export function analyse(
       : null,
     targetFailures: failing.filter((s) => outcomeOf(s, target) === 'target-5xx').length,
     retriesWhileFailing,
-    targetShareFailing: failing.length ? failing.filter((s) => s.backendId === target).length / failing.length : 0,
+    targetShareFailing: failing.length ? failing.filter((s) => s.unit === target).length / failing.length : 0,
     readmittedAfterS: readmit ? Math.max(0, readmit.t / 1000 - failEnd) : null,
     achievedRate,
     rateTooLow,
     clearlyNotEjected:
       !firstEjection &&
       failing.filter((s) => outcomeOf(s, target) === 'target-5xx').length >= FAILURES_TO_RULE_OUT_EJECTION &&
-      (failing.length ? failing.filter((s) => s.backendId === target).length / failing.length : 0) >=
+      (failing.length ? failing.filter((s) => s.unit === target).length / failing.length : 0) >=
         baselineShare * 0.5,
     proxy5xx: samples.filter((s) => outcomeOf(s, target) === 'proxy-5xx').length,
     errors: samples.filter((s) => outcomeOf(s, target) === 'error').length,

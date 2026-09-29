@@ -23,18 +23,20 @@ export async function GET(req: NextRequest) {
   try {
     const res = await fetch(target, { redirect: 'manual', cache: 'no-store', signal: ctrl.signal });
     let backendId = res.headers.get('x-backend-id');
+    let instanceId = res.headers.get('x-instance-id');
     try {
       const body = await res.json();
       if (body && typeof body.backendId === 'string') backendId = body.backendId;
+      if (body && typeof body.instanceId === 'string') instanceId = body.instanceId;
     } catch {
       // Not one of our origins (a WAF page, a proxy error): no backend id.
     }
     return NextResponse.json(
-      { status: res.status, ok: res.ok, ms: Date.now() - t0, backendId },
+      { status: res.status, ok: res.ok, ms: Date.now() - t0, backendId, instanceId },
       { headers: { 'Cache-Control': 'no-store' } },
     );
   } catch (e) {
-    return NextResponse.json({ status: 0, ok: false, ms: Date.now() - t0, backendId: null, error: String(e) });
+    return NextResponse.json({ status: 0, ok: false, ms: Date.now() - t0, backendId: null, instanceId: null, error: String(e) });
   } finally {
     clearTimeout(timer);
   }

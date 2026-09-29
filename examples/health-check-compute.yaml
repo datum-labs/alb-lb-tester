@@ -1,0 +1,26 @@
+# Passive health checks against a backend with several endpoints: the tester
+# running as a Datum Compute workload with 3 instances. Outlier detection
+# ejects endpoints within a backend, so fail one instance (Health checks tab,
+# Instances row) and watch its share go to the other two. Failing the whole
+# backend instead shows it keeping its weighted share, which is expected.
+#
+# The networkService name and port come from the workload's NetworkService;
+# the Vercel backend alongside it is optional and shows the weights holding.
+apiVersion: networking.datumapis.com/v1alpha
+kind: HTTPProxy
+metadata:
+  name: lb-tester-health-check-compute
+spec:
+  healthCheck:
+    passive:
+      consecutive5xxErrors: 5
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+  rules:
+    - backends:
+        - networkService:
+            name: alb-lb-tester
+            port: http
+          weight: 60
+        - endpoint: https://alb-tester-b.vercel.app
+          weight: 40
