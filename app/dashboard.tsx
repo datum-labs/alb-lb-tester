@@ -800,8 +800,9 @@ function HealthTab({
   }, [samples, backends]);
 
   const pct = (share: number) => `${(share * 100).toFixed(0)}%`;
-  // Ejection numbers from a thin run are noise; the summary explains why they're hidden.
-  const trusted = verdict && !verdict.rateTooLow ? verdict : null;
+  // A thin run is only inconclusive when it also lacks the evidence to decide.
+  const inconclusive = !!verdict && verdict.rateTooLow && verdict.ejectedAfterS === null && !verdict.clearlyNotEjected;
+  const trusted = verdict && !inconclusive ? verdict : null;
   const summary = (() => {
     if (!verdict || !cfg || !finished) return null;
     if (verdict.baselineToTarget === 0) {
@@ -810,8 +811,9 @@ function HealthTab({
         text: `No baseline requests reached "${cfg.target}". Check the backend id${verdict.baselineBackends.length ? ` (seen: ${verdict.baselineBackends.join(', ')})` : ''}.`,
       };
     }
-    // A thin run can't tell an ejection from chance, so say so rather than guess.
-    if (verdict.rateTooLow) {
+    // A thin run with too few failures can't tell an ejection from chance, so
+    // say so rather than guess. With enough failures, the rate doesn't matter.
+    if (inconclusive) {
       const rates = `${verdict.achievedRate.baseline.toFixed(1)} / ${verdict.achievedRate.failing.toFixed(1)} / ${verdict.achievedRate.recovery.toFixed(1)}`;
       return {
         tone: 'warn' as const,

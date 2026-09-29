@@ -108,8 +108,14 @@ export function bucketize(
  * none arriving is well under a 1% chance at any share.
  */
 export const EXPECTED_REQUESTS_TO_EJECT = 5;
-/** Below this share of the requested rate, the run is too thin to judge. */
+/** Below this share of the requested rate, a run is thin; only matters when the evidence is too. */
 export const MIN_RATE_RATIO = 0.7;
+/**
+ * Target failures that settle "not ejected" whatever the rate: several times
+ * any consecutive-5xx threshold, so even spread across a few edge proxies
+ * each one saw enough in a row to eject.
+ */
+export const FAILURES_TO_RULE_OUT_EJECTION = 25;
 
 export type HealthVerdict = {
   baselineToTarget: number;
@@ -130,8 +136,13 @@ export type HealthVerdict = {
   readmittedAfterS: number | null;
   /** Requests per second actually sent in each phase. */
   achievedRate: Record<Phase, number>;
-  /** Some phase ran well below the requested rate, so the verdict is unreliable. */
+  /** Some phase ran well below the requested rate. */
   rateTooLow: boolean;
+  /**
+   * Enough failures reached the target, and it kept enough of its share, that
+   * it clearly wasn't ejected, however thin the run.
+   */
+  clearlyNotEjected: boolean;
   proxy5xx: number;
   errors: number;
 };
@@ -216,6 +227,11 @@ export function analyse(
     readmittedAfterS: readmit ? Math.max(0, readmit.t / 1000 - failEnd) : null,
     achievedRate,
     rateTooLow,
+    clearlyNotEjected:
+      !firstEjection &&
+      failing.filter((s) => outcomeOf(s, target) === 'target-5xx').length >= FAILURES_TO_RULE_OUT_EJECTION &&
+      (failing.length ? failing.filter((s) => s.backendId === target).length / failing.length : 0) >=
+        baselineShare * 0.5,
     proxy5xx: samples.filter((s) => outcomeOf(s, target) === 'proxy-5xx').length,
     errors: samples.filter((s) => outcomeOf(s, target) === 'error').length,
   };
