@@ -1,0 +1,18 @@
+# Passive health checks (outlier detection). An endpoint that returns 5
+# consecutive 5xx is ejected for 30s, then re-admitted; repeat ejections last
+# longer. Use the dashboard's Health checks tab to make one backend fail and
+# watch it get ejected and come back.
+apiVersion: networking.datumapis.com/v1alpha
+kind: HTTPProxy
+metadata:
+  name: lb-tester-health-check
+spec:
+  healthCheck:
+    passive:
+      consecutive5xxErrors: 5
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+  rules:
+    - backends:
+        - endpoint: https://alb-tester-a.vercel.app
+        - endpoint: https://alb-tester-b.vercel.app

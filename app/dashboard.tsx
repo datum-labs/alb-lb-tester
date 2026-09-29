@@ -16,6 +16,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@datum-cloud/datum-ui/select';
+import {
+  analyse,
+  bucketize,
+  outcomeOf,
+  QUIET_SECONDS,
+  type HealthSample,
+  type Phase,
+} from './health-analysis';
 
 type Result = {
   n: number;
@@ -75,7 +83,7 @@ function download(name: string, text: string) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-type TabId = 'load' | 'inspect' | 'waf';
+type TabId = 'load' | 'inspect' | 'waf' | 'health';
 const TAB_STORAGE_KEY = 'alb-tester:tab';
 
 export function Dashboard() {
@@ -88,7 +96,7 @@ export function Dashboard() {
   useEffect(() => {
     try {
       const saved = localStorage.getItem(TAB_STORAGE_KEY);
-      if (saved === 'load' || saved === 'inspect' || saved === 'waf') setTab(saved);
+      if (saved === 'load' || saved === 'inspect' || saved === 'waf' || saved === 'health') setTab(saved);
     } catch {}
   }, []);
   useEffect(() => {
@@ -125,6 +133,7 @@ export function Dashboard() {
           <TabsTrigger value="load">Load balancing</TabsTrigger>
           <TabsTrigger value="inspect">Headers &amp; redirect</TabsTrigger>
           <TabsTrigger value="waf">WAF probes</TabsTrigger>
+          <TabsTrigger value="health">Health checks</TabsTrigger>
         </TabsList>
 
         {/* forceMount keeps all panels in the DOM; <Activity> preserves each
@@ -144,6 +153,12 @@ export function Dashboard() {
         <TabsContent value="waf" forceMount className="mt-4 data-[state=inactive]:hidden">
           <Activity mode={tab === 'waf' ? 'visible' : 'hidden'}>
             <WafTab base={base} path={path} item={item} container={container} />
+          </Activity>
+        </TabsContent>
+
+        <TabsContent value="health" forceMount className="mt-4 data-[state=inactive]:hidden">
+          <Activity mode={tab === 'health' ? 'visible' : 'hidden'}>
+            <HealthTab base={base} target={target} item={item} container={container} />
           </Activity>
         </TabsContent>
       </Tabs>
@@ -609,6 +624,366 @@ function WafTab({ base, path, item, container }: { base: string; path: string; i
                   </tbody>
                 </table>
               </motion.div>
+            </motion.div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+/* --------------------------------------------------------------- Health tab */
+
+const FAIL_STATUSES = [500, 502, 503, 504];
+const PHASE_TINT: Record<Phase, string> = {
+  baseline: 'var(--muted)',
+  failing: 'color-mix(in oklch, var(--destructive) 18%, var(--card))',
+  recovery: 'color-mix(in oklch, var(--chart-2) 18%, var(--card))',
+};
+const PHASE_LABEL: Record<Phase, string> = { baseline: 'Baseline', failing: 'Failing', recovery: 'Recovery' };
+
+function HealthTab({
+  base, target, item, container,
+}: { base: string; target: (p?: string) => string; item: Variants; container: Variants }) {
+  const [failTarget, setFailTarget] = useState('');
+  const [failStatus, setFailStatus] = useState(503);
+  const [rps, setRps] = useState(10);
+  const [baselineS, setBaselineS] = useState(10);
+  const [failingS, setFailingS] = useState(40);
+  const [recoveryS, setRecoveryS] = useState(70);
+  const [detected, setDetected] = useState<string[]>([]);
+  const [detecting, setDetecting] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const [samples, setSamples] = useState<HealthSample[]>([]);
+  // Settings of the run on screen, so editing the form doesn't re-analyse it.
+  const [runConfig, setRunConfig] = useState<{ target: string; baselineS: number; failingS: number; totalS: number } | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const cancel = useRef(false);
+  const store = useRef<HealthSample[]>([]);
+
+  // Probe server-side: a 503 the proxy generates itself has no CORS headers,
+  // so the browser couldn't read it (or tell it apart from a backend's 503).
+  async function probe(url: string) {
+    try {
+      const res = await fetch(`/api/probe?url=${encodeURIComponent(url)}`, { cache: 'no-store' });
+      const data = await res.json();
+      return { status: typeof data.status === 'number' ? data.status : 0, backendId: (data.backendId as string | null) ?? null };
+    } catch {
+      return { status: 0, backendId: null };
+    }
+  }
+
+  function requestUrl(n: number, failing: boolean, id: string) {
+    const url = new URL(target());
+    if (failing) {
+      url.searchParams.set('fail', id);
+      url.searchParams.set('failStatus', String(failStatus));
+    }
+    url.searchParams.set('_', String(n));
+    return url.toString();
+  }
+
+  async function detect() {
+    if (!base) { setNote('Enter the proxy base URL above first.'); return; }
+    setDetecting(true); setNote(null);
+    const results = await Promise.all(Array.from({ length: 20 }, (_, n) => probe(requestUrl(n, false, ''))));
+    const ids = [...new Set(results.map((r) => r.backendId).filter((id): id is string => !!id))].sort();
+    setDetected(ids);
+    if (!ids.length) setNote('No backend answered. Check the proxy URL and path.');
+    else if (!failTarget) setFailTarget(ids[ids.length - 1]);
+    setDetecting(false);
+  }
+
+  async function run() {
+    if (!base) { setNote('Enter the proxy base URL above first.'); return; }
+    const id = failTarget.trim();
+    if (!id) { setNote('Choose the backend to fail. Use Detect to list them.'); return; }
+    const rate = Math.max(1, Math.min(50, Math.floor(rps)));
+    const b = Math.max(1, Math.floor(baselineS));
+    const f = Math.max(1, Math.floor(failingS));
+    const r = Math.max(1, Math.floor(recoveryS));
+    const totalMs = (b + f + r) * 1000;
+
+    setRunning(true); setNote(null); setSamples([]); setElapsed(0);
+    setRunConfig({ target: id, baselineS: b, failingS: f, totalS: b + f + r });
+    store.current = [];
+    cancel.current = false;
+
+    const start = performance.now();
+    const inflight = new Set<Promise<void>>();
+    let n = 0;
+
+    await new Promise<void>((resolve) => {
+      const flush = setInterval(() => {
+        setSamples(store.current.slice());
+        setElapsed((performance.now() - start) / 1000);
+      }, 500);
+      // A fixed rate, not a fixed concurrency: ejection shows up as the target's
+      // share of a steady stream dropping to zero.
+      const timer = setInterval(() => {
+        const t = performance.now() - start;
+        if (cancel.current || t >= totalMs) {
+          clearInterval(timer);
+          clearInterval(flush);
+          resolve();
+          return;
+        }
+        const phase: Phase = t < b * 1000 ? 'baseline' : t < (b + f) * 1000 ? 'failing' : 'recovery';
+        const index = n++;
+        const job = probe(requestUrl(index, phase === 'failing', id)).then((res) => {
+          store.current.push({ n: index, t, phase, backendId: res.backendId, status: res.status });
+        });
+        inflight.add(job);
+        void job.finally(() => inflight.delete(job));
+      }, 1000 / rate);
+    });
+
+    await Promise.all(inflight);
+    store.current.sort((a, x) => a.n - x.n);
+    setSamples(store.current.slice());
+    setElapsed((performance.now() - start) / 1000);
+    setRunning(false);
+  }
+
+  const cfg = runConfig;
+  const buckets = useMemo(
+    () => (cfg ? bucketize(samples, cfg.target, cfg.totalS, cfg.baselineS, cfg.failingS) : []),
+    [samples, cfg],
+  );
+  const verdict = useMemo(
+    () => (cfg ? analyse(samples, buckets, cfg.target, cfg.baselineS, cfg.failingS) : null),
+    [samples, buckets, cfg],
+  );
+  const backends = useMemo(() => {
+    const ids = new Set<string>();
+    for (const s of samples) if (s.backendId) ids.add(s.backendId);
+    return [...ids].sort();
+  }, [samples]);
+  const colorFor = (id: string) => CHART[Math.max(0, backends.indexOf(id)) % CHART.length];
+  const maxBucket = Math.max(1, ...buckets.map((b) => b.total));
+  const finished = !running && !!cfg && samples.length > 0;
+
+  const perPhase = useMemo(() => {
+    const phases: Phase[] = ['baseline', 'failing', 'recovery'];
+    return backends.map((id) => ({
+      id,
+      counts: phases.map((phase) => {
+        const inPhase = samples.filter((s) => s.phase === phase);
+        const mine = inPhase.filter((s) => s.backendId === id);
+        return { count: mine.length, share: inPhase.length ? (mine.length / inPhase.length) * 100 : 0 };
+      }),
+    }));
+  }, [samples, backends]);
+
+  const summary = (() => {
+    if (!verdict || !cfg || !finished) return null;
+    if (verdict.baselineToTarget === 0) {
+      return {
+        good: false,
+        text: `No baseline requests reached "${cfg.target}". Check the backend id${verdict.baselineBackends.length ? ` (seen: ${verdict.baselineBackends.join(', ')})` : ''}.`,
+      };
+    }
+    if (verdict.ejectedAfterS !== null) {
+      const readmit = verdict.readmittedAfterS === null
+        ? ' It had not been re-admitted by the end of the run; try a longer recovery phase.'
+        : ` It was re-admitted ${verdict.readmittedAfterS.toFixed(0)}s after the failures stopped.`;
+      return {
+        good: true,
+        text: `Ejected: "${cfg.target}" stopped receiving traffic ${verdict.ejectedAfterS}s into the failure window, after ${verdict.failuresBeforeEject} 5xx responses.${readmit}`,
+      };
+    }
+    return {
+      good: false,
+      text: `Not ejected: "${cfg.target}" received ${(verdict.targetShareFailing * 100).toFixed(0)}% of requests for the whole failure window.`,
+    };
+  })();
+
+  return (
+    <div className="grid items-start gap-4 md:grid-cols-[340px_1fr]">
+      <Card>
+        <CardHeader><CardTitle className="text-sm">Health check test</CardTitle></CardHeader>
+        <CardContent className="space-y-4">
+          <p className="text-muted-foreground text-xs">
+            Makes one backend answer 5xx for a while, then watches whether the proxy stops sending it traffic (ejection) and when it comes back (re-admission). Needs outlier detection on the load balancer.
+          </p>
+
+          <div className="space-y-1.5">
+            <Label htmlFor="hc-target">Backend to fail</Label>
+            <div className="flex gap-2">
+              <Input id="hc-target" value={failTarget} onChange={(e) => setFailTarget(e.target.value)} placeholder="backend-b" className="flex-1" disabled={running} />
+              <Button theme="outline" loading={detecting} onClick={detect} disabled={running}>Detect</Button>
+            </div>
+            {detected.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 pt-1">
+                {detected.map((id) => (
+                  <button key={id} type="button" disabled={running} onClick={() => setFailTarget(id)}
+                    className="rounded-md border px-2 py-0.5 font-mono text-xs transition-colors disabled:opacity-50"
+                    style={failTarget === id ? { borderColor: 'var(--destructive)', background: 'color-mix(in oklch, var(--destructive) 12%, var(--card))' } : undefined}>
+                    {id}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1.5">
+              <Label htmlFor="hc-rps">Requests / s</Label>
+              <Input id="hc-rps" type="number" min={1} max={50} value={rps} onChange={(e) => setRps(+e.target.value)} disabled={running} />
+            </div>
+            <div className="space-y-1.5">
+              <Label>Fail with</Label>
+              <Select value={String(failStatus)} onValueChange={(v) => setFailStatus(+v)} disabled={running}>
+                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {FAIL_STATUSES.map((code) => <SelectItem key={code} value={String(code)}>{code}</SelectItem>)}
+                </SelectContent>
+              </Select>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-3 gap-3">
+            <div className="space-y-1.5">
+              <Label htmlFor="hc-b">Baseline s</Label>
+              <Input id="hc-b" type="number" min={1} value={baselineS} onChange={(e) => setBaselineS(+e.target.value)} disabled={running} />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="hc-f">Failing s</Label>
+              <Input id="hc-f" type="number" min={1} value={failingS} onChange={(e) => setFailingS(+e.target.value)} disabled={running} />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="hc-r">Recovery s</Label>
+              <Input id="hc-r" type="number" min={1} value={recoveryS} onChange={(e) => setRecoveryS(+e.target.value)} disabled={running} />
+            </div>
+          </div>
+          <p className="text-muted-foreground text-xs">
+            The defaults suit the portal&rsquo;s defaults (eject after 5 consecutive 5xx for 30s): the failing phase outlasts one ejection so you can see it retried, and recovery outlasts the longer second ejection.
+          </p>
+
+          {!running ? (
+            <Button block onClick={run}>Run health check test</Button>
+          ) : (
+            <Button block theme="outline" onClick={() => (cancel.current = true)}>
+              Stop · {elapsed.toFixed(0)}/{cfg?.totalS ?? 0}s
+            </Button>
+          )}
+          {samples.length > 0 && !running && (
+            <Button block theme="link" onClick={() => download('alb-health-results.csv',
+              'n,t_ms,phase,backendId,status\n' + samples.map((s) => `${s.n},${s.t.toFixed(0)},${s.phase},${s.backendId ?? ''},${s.status}`).join('\n'))}>
+              Export CSV
+            </Button>
+          )}
+          {note && <p className="text-destructive text-xs">{note}</p>}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader><CardTitle className="text-sm">Results</CardTitle></CardHeader>
+        <CardContent>
+          {!cfg || samples.length === 0 ? (
+            <div className="text-muted-foreground py-12 text-center text-sm">
+              {running ? 'Starting…' : 'No run yet. Pick a backend to fail and run the test.'}
+            </div>
+          ) : (
+            <motion.div className="space-y-5" variants={container} initial="hidden" animate="show">
+              <motion.div variants={item} className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
+                <Stat
+                  n={verdict?.ejectedAfterS == null ? '—' : <>{verdict.ejectedAfterS}<Unit>s</Unit></>}
+                  label="Ejected after"
+                  tone={verdict?.ejectedAfterS != null ? 'var(--chart-2)' : undefined}
+                />
+                <Stat n={verdict?.failuresBeforeEject ?? '—'} label="5xx before eject" />
+                <Stat n={verdict?.retriesWhileFailing ?? 0} label="Retried while failing" />
+                <Stat
+                  n={verdict?.readmittedAfterS == null ? '—' : <>{verdict.readmittedAfterS.toFixed(0)}<Unit>s</Unit></>}
+                  label="Re-admitted after"
+                />
+              </motion.div>
+
+              {summary && (
+                <motion.div variants={item} className="space-y-1.5 rounded-md border px-3 py-2.5 text-sm"
+                  style={{ borderColor: summary.good ? 'var(--chart-2)' : 'var(--chart-5)', background: `color-mix(in oklch, ${summary.good ? 'var(--chart-2)' : 'var(--chart-5)'} 12%, var(--card))` }}>
+                  <p>{summary.text}</p>
+                  {!summary.good && verdict && verdict.baselineToTarget > 0 && (
+                    <ul className="text-muted-foreground list-disc space-y-0.5 pl-4 text-xs">
+                      <li>Outlier detection is off, or its 5xx threshold is higher than the failures this run sent.</li>
+                      <li>Each backend on its own hostname is its own upstream. With a single endpoint, ejecting it leaves no healthy host, so the proxy may keep routing to it anyway.</li>
+                    </ul>
+                  )}
+                  {verdict && verdict.proxy5xx > 0 && (
+                    <p className="text-muted-foreground text-xs">{verdict.proxy5xx} requests got a 5xx from the proxy itself, with no backend behind it.</p>
+                  )}
+                </motion.div>
+              )}
+
+              <motion.div variants={item}>
+                <SectionLabel>Timeline <span className="text-muted-foreground/70 normal-case">— requests per second</span></SectionLabel>
+                <div className="relative flex h-36 items-end gap-px">
+                  {buckets.map((b) => {
+                    const segments: { key: string; value: number; color: string }[] = [
+                      ...[...b.ok.entries()].map(([id, value]) => ({ key: id, value, color: colorFor(id) })),
+                      { key: 'target-5xx', value: b.target5xx, color: 'var(--destructive)' },
+                      { key: 'backend-5xx', value: b.backend5xx, color: 'var(--chart-5)' },
+                      { key: 'proxy-5xx', value: b.proxy5xx, color: 'var(--foreground)' },
+                      { key: 'errors', value: b.errors, color: 'var(--muted-foreground)' },
+                    ].filter((seg) => seg.value > 0);
+                    return (
+                      <div key={b.second} className="flex h-full min-w-px flex-1 flex-col justify-end"
+                        style={{ background: PHASE_TINT[b.phase] }}
+                        title={`${b.second}s · ${PHASE_LABEL[b.phase]} · ${b.total} req · ${b.toTarget} to ${cfg.target}`}>
+                        {segments.map((seg) => (
+                          <div key={seg.key} style={{ height: `${(seg.value / maxBucket) * 100}%`, background: seg.color }} />
+                        ))}
+                      </div>
+                    );
+                  })}
+                  {verdict?.ejectedAfterS != null && (
+                    <div className="pointer-events-none absolute inset-y-0 w-px"
+                      style={{ left: `${((cfg.baselineS + verdict.ejectedAfterS) / cfg.totalS) * 100}%`, background: 'var(--foreground)' }}
+                      title={`Ejected at ${cfg.baselineS + verdict.ejectedAfterS}s`} />
+                  )}
+                </div>
+                <div className="text-muted-foreground mt-1.5 flex text-[10.5px]">
+                  {(['baseline', 'failing', 'recovery'] as Phase[]).map((phase) => {
+                    const width = phase === 'baseline' ? cfg.baselineS : phase === 'failing' ? cfg.failingS : cfg.totalS - cfg.baselineS - cfg.failingS;
+                    return <div key={phase} style={{ width: `${(width / cfg.totalS) * 100}%` }} className="truncate">{PHASE_LABEL[phase]}</div>;
+                  })}
+                </div>
+                <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs">
+                  {backends.map((id) => (
+                    <span key={id} className="font-mono"><Dot color={colorFor(id)} />{id}{id === cfg.target ? ' (target)' : ''}</span>
+                  ))}
+                  <span><Dot color="var(--destructive)" />target 5xx</span>
+                  <span><Dot color="var(--foreground)" />proxy 5xx</span>
+                  {verdict?.ejectedAfterS != null && <span className="text-muted-foreground">│ ejected ({QUIET_SECONDS}s with no traffic)</span>}
+                </div>
+              </motion.div>
+
+              {perPhase.length > 0 && (
+                <motion.div variants={item}>
+                  <SectionLabel>Share by phase</SectionLabel>
+                  <table className="w-full text-xs tabular-nums">
+                    <thead><tr className="text-muted-foreground text-left">
+                      <Th>Backend</Th><Th>Baseline</Th><Th>Failing</Th><Th>Recovery</Th>
+                    </tr></thead>
+                    <tbody>
+                      {perPhase.map((row) => (
+                        <tr key={row.id}>
+                          <Td className="font-mono"><Dot color={colorFor(row.id)} />{row.id}{row.id === cfg.target ? ' (target)' : ''}</Td>
+                          {row.counts.map((c, i) => <Td key={i}>{c.count} · {c.share.toFixed(0)}%</Td>)}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </motion.div>
+              )}
+
+              {samples.some((s) => outcomeOf(s, cfg.target) === 'error') && (
+                <motion.p variants={item} className="text-muted-foreground text-xs">
+                  {verdict?.errors} requests failed before a response (timeout or network error).
+                </motion.p>
+              )}
             </motion.div>
           )}
         </CardContent>

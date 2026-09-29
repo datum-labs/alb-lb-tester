@@ -2,7 +2,9 @@ import { NextRequest, NextResponse } from 'next/server';
 
 // Server-side single-request probe. Returns the real status code the proxy
 // gave, which the browser cannot read for cross-origin responses that lack
-// CORS headers (a WAF 403 block page, or a plain HTML 200).
+// CORS headers (a WAF 403 block page, a plain HTML 200, or a 503 the proxy
+// generates itself). Also reports which backend answered, when it was one of
+// ours, so a proxy-generated error can be told apart from an origin's.
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
 
@@ -20,12 +22,19 @@ export async function GET(req: NextRequest) {
   const t0 = Date.now();
   try {
     const res = await fetch(target, { redirect: 'manual', cache: 'no-store', signal: ctrl.signal });
+    let backendId = res.headers.get('x-backend-id');
+    try {
+      const body = await res.json();
+      if (body && typeof body.backendId === 'string') backendId = body.backendId;
+    } catch {
+      // Not one of our origins (a WAF page, a proxy error): no backend id.
+    }
     return NextResponse.json(
-      { status: res.status, ok: res.ok, ms: Date.now() - t0 },
+      { status: res.status, ok: res.ok, ms: Date.now() - t0, backendId },
       { headers: { 'Cache-Control': 'no-store' } },
     );
   } catch (e) {
-    return NextResponse.json({ status: 0, ok: false, ms: Date.now() - t0, error: String(e) });
+    return NextResponse.json({ status: 0, ok: false, ms: Date.now() - t0, backendId: null, error: String(e) });
   } finally {
     clearTimeout(timer);
   }

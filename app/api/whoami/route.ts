@@ -28,6 +28,22 @@ const corsHeaders: Record<string, string> = {
   'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
 };
 
+/**
+ * Failure injection for health-check testing. `?fail=backend-b` (a
+ * comma-separated list, or `*` for every backend) makes the named backend
+ * answer with `?failStatus` (default 503) instead of 200. It's per request
+ * and stateless, so it works across serverless instances and through the
+ * proxy: only requests that carry it fail, and only on the named backend.
+ */
+function failureFor(url: URL, id: string): number | null {
+  const fail = url.searchParams.get('fail');
+  if (!fail) return null;
+  const targets = fail.split(',').map((s) => s.trim());
+  if (!targets.includes('*') && !targets.includes(id)) return null;
+  const requested = Number(url.searchParams.get('failStatus') ?? 503);
+  return Number.isInteger(requested) && requested >= 500 && requested <= 599 ? requested : 503;
+}
+
 export async function OPTIONS() {
   return new NextResponse(null, { status: 204, headers: corsHeaders });
 }
@@ -36,6 +52,15 @@ function handle(req: NextRequest) {
   requestCount += 1;
   const headers = Object.fromEntries(req.headers.entries());
   const id = backendId();
+  const url = new URL(req.url);
+  const failStatus = failureFor(url, id);
+
+  if (failStatus !== null) {
+    return NextResponse.json(
+      { backendId: id, instanceId, failed: true, status: failStatus, servedAt: new Date().toISOString() },
+      { status: failStatus, headers: { ...corsHeaders, 'x-backend-id': id } },
+    );
+  }
 
   const body = {
     backendId: id,
@@ -52,7 +77,7 @@ function handle(req: NextRequest) {
     forwardedHost: headers['x-forwarded-host'] ?? null,
     lbKey: headers['x-lb-key'] ?? null,
     method: req.method,
-    path: new URL(req.url).pathname,
+    path: url.pathname,
     headers,
   };
 
