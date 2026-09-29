@@ -26,6 +26,8 @@ concurrency:
 
 env:
   DATUMCTL_VERSION: 0.20.0
+  # `datumctl compute` is a plugin, not part of datumctl itself.
+  COMPUTE_PLUGIN_VERSION: v0.10.9
 
 jobs:
   build:
@@ -45,6 +47,8 @@ jobs:
           curl -fsSL -o datumctl.deb \
             "https://github.com/datum-cloud/datumctl/releases/download/v${DATUMCTL_VERSION}/datumctl_${DATUMCTL_VERSION}_linux_amd64.deb"
           sudo dpkg -i datumctl.deb
+          datumctl plugin install "compute@${COMPUTE_PLUGIN_VERSION}"
+          datumctl compute build --help > /dev/null
 
       # --analyze fails the build on the two problems that otherwise only show
       # up after boot: an entrypoint that isn't x86_64, and a shared library
