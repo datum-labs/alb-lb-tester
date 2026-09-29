@@ -22,8 +22,10 @@ RUN mkdir -p /out/app \
 # no package manager, a small root filesystem to hold in RAM.
 FROM gcr.io/distroless/nodejs22-debian12
 COPY --from=build /out/app /app
-# Bind every interface: Next's standalone server listens on $HOSTNAME.
-ENV NODE_ENV=production PORT=3000 HOSTNAME=0.0.0.0
+# Next's standalone server listens on $HOSTNAME. Compute instances get IPv6
+# addresses only, so bind "::" (every interface, IPv6 and IPv4); "0.0.0.0" is
+# IPv4 only and leaves the edge's connections refused.
+ENV NODE_ENV=production PORT=3000 HOSTNAME=::
 EXPOSE 3000
 WORKDIR /
 # server.js changes into its own directory before it loads the app.
