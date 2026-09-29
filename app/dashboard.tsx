@@ -20,7 +20,6 @@ import {
   analyse,
   bucketize,
   outcomeOf,
-  QUIET_SECONDS,
   type HealthSample,
   type Phase,
 } from './health-analysis';
@@ -635,6 +634,30 @@ function WafTab({ base, path, item, container }: { base: string; path: string; i
 /* --------------------------------------------------------------- Health tab */
 
 const FAIL_STATUSES = [500, 502, 503, 504];
+
+/**
+ * A timer that holds its rate in a background tab. Page timers there are
+ * throttled to about one tick a second (less after a few minutes), which
+ * starved an earlier run of requests and faked an ejection. Dedicated worker
+ * timers aren't throttled that way, and their messages still arrive, so the
+ * run keeps its pace while you watch the portal in another tab.
+ */
+function startTicker(intervalMs: number, onTick: () => void): () => void {
+  try {
+    const source = `const id = setInterval(() => postMessage(0), ${intervalMs}); onmessage = () => clearInterval(id);`;
+    const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+    const worker = new Worker(url);
+    worker.onmessage = onTick;
+    return () => {
+      worker.postMessage('stop');
+      worker.terminate();
+      URL.revokeObjectURL(url);
+    };
+  } catch {
+    const id = setInterval(onTick, intervalMs);
+    return () => clearInterval(id);
+  }
+}
 const PHASE_TINT: Record<Phase, string> = {
   baseline: 'var(--muted)',
   failing: 'color-mix(in oklch, var(--destructive) 18%, var(--card))',
@@ -657,7 +680,7 @@ function HealthTab({
   const [elapsed, setElapsed] = useState(0);
   const [samples, setSamples] = useState<HealthSample[]>([]);
   // Settings of the run on screen, so editing the form doesn't re-analyse it.
-  const [runConfig, setRunConfig] = useState<{ target: string; baselineS: number; failingS: number; totalS: number } | null>(null);
+  const [runConfig, setRunConfig] = useState<{ target: string; baselineS: number; failingS: number; totalS: number; rate: number } | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const cancel = useRef(false);
   const store = useRef<HealthSample[]>([]);
@@ -706,7 +729,7 @@ function HealthTab({
     const totalMs = (b + f + r) * 1000;
 
     setRunning(true); setNote(null); setSamples([]); setElapsed(0);
-    setRunConfig({ target: id, baselineS: b, failingS: f, totalS: b + f + r });
+    setRunConfig({ target: id, baselineS: b, failingS: f, totalS: b + f + r, rate });
     store.current = [];
     cancel.current = false;
 
@@ -721,10 +744,10 @@ function HealthTab({
       }, 500);
       // A fixed rate, not a fixed concurrency: ejection shows up as the target's
       // share of a steady stream dropping to zero.
-      const timer = setInterval(() => {
+      const stop = startTicker(1000 / rate, () => {
         const t = performance.now() - start;
         if (cancel.current || t >= totalMs) {
-          clearInterval(timer);
+          stop();
           clearInterval(flush);
           resolve();
           return;
@@ -736,7 +759,7 @@ function HealthTab({
         });
         inflight.add(job);
         void job.finally(() => inflight.delete(job));
-      }, 1000 / rate);
+      });
     });
 
     await Promise.all(inflight);
@@ -752,7 +775,7 @@ function HealthTab({
     [samples, cfg],
   );
   const verdict = useMemo(
-    () => (cfg ? analyse(samples, buckets, cfg.target, cfg.baselineS, cfg.failingS) : null),
+    () => (cfg ? analyse(samples, buckets, cfg.target, cfg.baselineS, cfg.failingS, cfg.rate) : null),
     [samples, buckets, cfg],
   );
   const backends = useMemo(() => {
@@ -776,28 +799,43 @@ function HealthTab({
     }));
   }, [samples, backends]);
 
+  const pct = (share: number) => `${(share * 100).toFixed(0)}%`;
+  // Ejection numbers from a thin run are noise; the summary explains why they're hidden.
+  const trusted = verdict && !verdict.rateTooLow ? verdict : null;
   const summary = (() => {
     if (!verdict || !cfg || !finished) return null;
     if (verdict.baselineToTarget === 0) {
       return {
-        good: false,
+        tone: 'bad' as const,
         text: `No baseline requests reached "${cfg.target}". Check the backend id${verdict.baselineBackends.length ? ` (seen: ${verdict.baselineBackends.join(', ')})` : ''}.`,
       };
     }
+    // A thin run can't tell an ejection from chance, so say so rather than guess.
+    if (verdict.rateTooLow) {
+      const rates = `${verdict.achievedRate.baseline.toFixed(1)} / ${verdict.achievedRate.failing.toFixed(1)} / ${verdict.achievedRate.recovery.toFixed(1)}`;
+      return {
+        tone: 'warn' as const,
+        text: `Inconclusive: requests ran well below ${cfg.rate}/s (baseline / failing / recovery: ${rates} req/s), too few to judge an ejection. Run it again and keep this tab open, or raise the rate.`,
+      };
+    }
     if (verdict.ejectedAfterS !== null) {
+      const retries = verdict.retriesWhileFailing > 0
+        ? ` The proxy tried it again ${verdict.retriesWhileFailing} ${verdict.retriesWhileFailing === 1 ? 'time' : 'times'} while it was still failing.`
+        : '';
       const readmit = verdict.readmittedAfterS === null
         ? ' It had not been re-admitted by the end of the run; try a longer recovery phase.'
         : ` It was re-admitted ${verdict.readmittedAfterS.toFixed(0)}s after the failures stopped.`;
       return {
-        good: true,
-        text: `Ejected: "${cfg.target}" stopped receiving traffic ${verdict.ejectedAfterS}s into the failure window, after ${verdict.failuresBeforeEject} 5xx responses.${readmit}`,
+        tone: 'good' as const,
+        text: `Ejected: "${cfg.target}" stopped receiving traffic ${verdict.ejectedAfterS}s into the failure window, after ${verdict.failuresBeforeEject} 5xx responses.${retries}${readmit}`,
       };
     }
     return {
-      good: false,
-      text: `Not ejected: "${cfg.target}" received ${(verdict.targetShareFailing * 100).toFixed(0)}% of requests for the whole failure window.`,
+      tone: 'bad' as const,
+      text: `Not ejected: "${cfg.target}" kept ${pct(verdict.targetShareFailing)} of requests while failing (${pct(verdict.baselineShare)} at baseline) and returned ${verdict.targetFailures} 5xx responses.`,
     };
   })();
+  const toneColor = { good: 'var(--chart-2)', warn: 'var(--chart-4)', bad: 'var(--chart-5)' } as const;
 
   return (
     <div className="grid items-start gap-4 md:grid-cols-[340px_1fr]">
@@ -889,25 +927,29 @@ function HealthTab({
             <motion.div className="space-y-5" variants={container} initial="hidden" animate="show">
               <motion.div variants={item} className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
                 <Stat
-                  n={verdict?.ejectedAfterS == null ? '—' : <>{verdict.ejectedAfterS}<Unit>s</Unit></>}
+                  n={trusted?.ejectedAfterS == null ? '—' : <>{trusted.ejectedAfterS}<Unit>s</Unit></>}
                   label="Ejected after"
-                  tone={verdict?.ejectedAfterS != null ? 'var(--chart-2)' : undefined}
+                  tone={trusted?.ejectedAfterS != null ? 'var(--chart-2)' : undefined}
                 />
-                <Stat n={verdict?.failuresBeforeEject ?? '—'} label="5xx before eject" />
-                <Stat n={verdict?.retriesWhileFailing ?? 0} label="Retried while failing" />
+                <Stat n={trusted?.failuresBeforeEject ?? '—'} label="5xx before eject" />
                 <Stat
-                  n={verdict?.readmittedAfterS == null ? '—' : <>{verdict.readmittedAfterS.toFixed(0)}<Unit>s</Unit></>}
+                  n={verdict ? <>{pct(verdict.targetShareFailing)}<Unit> vs {pct(verdict.baselineShare)}</Unit></> : '—'}
+                  label="Share failing vs baseline"
+                />
+                <Stat
+                  n={trusted?.readmittedAfterS == null ? '—' : <>{trusted.readmittedAfterS.toFixed(0)}<Unit>s</Unit></>}
                   label="Re-admitted after"
                 />
               </motion.div>
 
               {summary && (
                 <motion.div variants={item} className="space-y-1.5 rounded-md border px-3 py-2.5 text-sm"
-                  style={{ borderColor: summary.good ? 'var(--chart-2)' : 'var(--chart-5)', background: `color-mix(in oklch, ${summary.good ? 'var(--chart-2)' : 'var(--chart-5)'} 12%, var(--card))` }}>
+                  style={{ borderColor: toneColor[summary.tone], background: `color-mix(in oklch, ${toneColor[summary.tone]} 12%, var(--card))` }}>
                   <p>{summary.text}</p>
-                  {!summary.good && verdict && verdict.baselineToTarget > 0 && (
+                  {summary.tone === 'bad' && verdict && verdict.baselineToTarget > 0 && (
                     <ul className="text-muted-foreground list-disc space-y-0.5 pl-4 text-xs">
                       <li>Outlier detection is off, or its 5xx threshold is higher than the failures this run sent.</li>
+                      <li>Every edge proxy counts consecutive 5xx on its own. Spread across several proxies, no single one may have seen enough in a row; a higher rate or longer failing phase helps.</li>
                       <li>Each backend on its own hostname is its own upstream. With a single endpoint, ejecting it leaves no healthy host, so the proxy may keep routing to it anyway.</li>
                     </ul>
                   )}
@@ -938,10 +980,10 @@ function HealthTab({
                       </div>
                     );
                   })}
-                  {verdict?.ejectedAfterS != null && (
+                  {trusted?.ejectedAfterS != null && (
                     <div className="pointer-events-none absolute inset-y-0 w-px"
-                      style={{ left: `${((cfg.baselineS + verdict.ejectedAfterS) / cfg.totalS) * 100}%`, background: 'var(--foreground)' }}
-                      title={`Ejected at ${cfg.baselineS + verdict.ejectedAfterS}s`} />
+                      style={{ left: `${((cfg.baselineS + trusted.ejectedAfterS) / cfg.totalS) * 100}%`, background: 'var(--foreground)' }}
+                      title={`Ejected at ${cfg.baselineS + trusted.ejectedAfterS}s`} />
                   )}
                 </div>
                 <div className="text-muted-foreground mt-1.5 flex text-[10.5px]">
@@ -956,7 +998,7 @@ function HealthTab({
                   ))}
                   <span><Dot color="var(--destructive)" />target 5xx</span>
                   <span><Dot color="var(--foreground)" />proxy 5xx</span>
-                  {verdict?.ejectedAfterS != null && <span className="text-muted-foreground">│ ejected ({QUIET_SECONDS}s with no traffic)</span>}
+                  {trusted?.ejectedAfterS != null && <span className="text-muted-foreground">│ ejected (no traffic where ~5 requests were expected)</span>}
                 </div>
               </motion.div>
 
