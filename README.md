@@ -94,7 +94,7 @@ To see an ejection, fail one endpoint of a backend that has several. Run the tes
 
 Datum Compute runs unikernels, so the image is built with `datumctl compute build` from `Dockerfile.datum` rather than `docker build`. The final stage is distroless Node (the binary and the shared libraries it links against, no shell) running Next's standalone server; `--analyze` checks the entrypoint and its libraries before packaging.
 
-The **Compute image** workflow builds it on every push to `main` that touches the app and publishes `ghcr.io/mattdjenkinson/alb-lb-tester:latest` and `:sha-<commit>`. To build by hand, with Docker running and a GHCR login that can write packages:
+The **Compute image** workflow builds it on every push to `main` that touches the app and publishes `ghcr.io/datum-labs/alb-lb-tester:latest` and `:sha-<commit>`. To build by hand, with Docker running and a GHCR login that can write packages:
 
 ```bash
 datumctl compute build --analyze --push --output ghcr.io/<you>/alb-lb-tester:latest .
@@ -103,11 +103,11 @@ datumctl compute build --analyze --push --output ghcr.io/<you>/alb-lb-tester:lat
 Then create a Compute workload from the image with **3 instances**, port `http` on **3000**, and environment `BACKEND_ID=compute`:
 
 ```bash
-datumctl compute deploy alb-lb-tester --image ghcr.io/mattdjenkinson/alb-lb-tester:latest \
+datumctl compute deploy alb-lb-tester --image ghcr.io/datum-labs/alb-lb-tester:latest \
   --location us-central-1 --min 3 --http-port 3000 --env BACKEND_ID=compute
 ```
 
-The server binds `::` because Compute instances only have IPv6 addresses; an image built before that fix needs `--env HOSTNAME=::`. Each instance picks its own id at start; set `INSTANCE_ID` to name them yourself. The repository is private, so its package is too: either make the `alb-lb-tester` package public in its GitHub package settings, or give the workload an image pull secret.
+The server binds `::` because Compute instances only have IPv6 addresses; an image built before that fix needs `--env HOSTNAME=::`. Each instance picks its own id at start; set `INSTANCE_ID` to name them yourself. The repository and its package are public, so the workload needs no image pull secret. A project without a network named `default` needs `--network <name> --yes`, which creates one.
 
 ## Notes
 
