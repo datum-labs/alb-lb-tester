@@ -131,6 +131,16 @@ datumctl compute deploy alb-lb-tester --image ghcr.io/datum-labs/alb-lb-tester:l
 
 The server binds `::` because Compute instances only have IPv6 addresses; an image built before that fix needs `--env HOSTNAME=::`. Each instance picks its own id at start; set `INSTANCE_ID` to name them yourself. The repository and its package are public, so the workload needs no image pull secret. A project without a network named `default` needs `--network <name> --yes`, which creates one.
 
+### Regular container image
+
+The same workflow also builds `Dockerfile.datum` with plain Docker and publishes it as `ghcr.io/datum-labs/alb-lb-tester:container-latest` and `:container-sha-<commit>`. The `latest` and `sha-*` tags are unikernel images and run only on Compute's default unikernel runtime; the `container-*` tags run anywhere a container does, including Compute's general-purpose runtime:
+
+```bash
+datumctl compute deploy alb-lb-tester-gp --image ghcr.io/datum-labs/alb-lb-tester:container-latest   --runtime-class general-purpose --location us-east-1 --min 3 --http-port 3000 --env BACKEND_ID=compute-gp
+
+docker run -p 3000:3000 -e BACKEND_ID=local ghcr.io/datum-labs/alb-lb-tester:container-latest
+```
+
 ## Notes
 
 - The echo endpoint sends permissive CORS headers so the browser can read responses through the proxy.
