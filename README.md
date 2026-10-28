@@ -8,7 +8,7 @@ A tiny site for exercising two Datum HTTPProxy features against real backends:
 
 It has two halves:
 
-1. **Origin echo** at `GET /api/whoami` — returns JSON naming which backend served the request (`backendId`), plus the client IP, Host header, and the `x-lb-key` header. This is what your HTTPProxy backends point at. Deploy it two or three times so you have distinct origins. Add `?fail=<backendId>` (comma-separated, or `*`) and the named backend answers with `?failStatus` (default 503) instead; every other backend ignores it.
+1. **Origin echo** at `GET /api/whoami` — returns JSON naming which backend served the request (`backendId`), plus the client IP, Host header, and the `x-lb-key` header. This is what your HTTPProxy backends point at. Deploy it two or three times so you have distinct origins. Add `?fail=<backendId>` (comma-separated, or `*`) and the named backend misbehaves instead: by default it answers `?failStatus` (default 503), and it can also answer slowly, hang, or fail only some requests (see [Failure injection](#failure-injection)). Every other backend ignores it.
 2. **Dashboard** at `/` — fires a burst of requests through your proxy URL and charts which backend served each one, so you can see weights and algorithms at work.
 
 ## Deploy the backends to Vercel
@@ -89,6 +89,28 @@ Requests go through the server-side probe so a 503 the proxy generates itself (n
 Outlier detection ejects **endpoints within a backend**. It doesn't move traffic between backends: a backend whose every endpoint fails keeps its weighted share. So failing a whole Vercel backend (one app behind shared anycast IPs) will always report *not ejected*, and that's the expected result.
 
 To see an ejection, fail one endpoint of a backend that has several. Run the tester as a **Datum Compute workload with 3 instances** and add it to the load balancer as a Datum compute backend (see `examples/health-check-compute.yaml`). Three instances rather than two: with max ejected at 50% one of three can go, and the other two keep the backend well above the proxy's panic threshold, where it would ignore health and route to every endpoint.
+
+## Failure injection
+
+`?fail=<backend or instance>` picks who misbehaves; everything else is optional. Requests without `?fail`, and backends it doesn't name, answer normally.
+
+| Parameter | Values | Default | Effect |
+| --- | --- | --- | --- |
+| `failMode` | `error`, `delay`, `jitter`, `hang` | `error` | How the named target misbehaves |
+| `failStatus` | 500–599 | 503 | Status returned in `error` mode |
+| `delayMs` | 0–60000 | 1000 | Wait before answering 200, in `delay` mode |
+| `jitterMin`, `jitterMax` | 0–60000 | 100, 2000 | Random wait range before answering 200, in `jitter` mode |
+| `failPercent` | 0–100 | 100 | Share of matching requests that misbehave; the rest answer normally |
+
+`hang` holds the request open without answering, so the proxy's own timeout decides what happens. The origin gives up on a hung request when the client disconnects, or after 10 minutes with a 504. Responses that were delayed or failed carry an `x-fail-mode` header, and delayed ones also include `failMode` and `delayedMs` in the body.
+
+```bash
+# backend-b answers after 3 seconds
+curl "https://<proxy>/api/whoami?fail=backend-b&failMode=delay&delayMs=3000"
+
+# one instance hangs on 30% of requests
+curl "https://<proxy>/api/whoami?fail=ab12cd&failMode=hang&failPercent=30"
+```
 
 ## Run on Datum Compute
 
