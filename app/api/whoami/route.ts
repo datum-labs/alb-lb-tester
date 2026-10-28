@@ -26,45 +26,111 @@ const corsHeaders: Record<string, string> = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': '*',
-  'Access-Control-Expose-Headers': 'x-backend-id, x-instance-id',
+  'Access-Control-Expose-Headers': 'x-backend-id, x-instance-id, x-fail-mode',
   'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
 };
+
+// Longest a delay may be asked for, and how long a hang holds a request
+// before giving up on it, so a forgotten client can't pin an instance forever.
+const MAX_DELAY_MS = 60_000;
+const MAX_HANG_MS = 10 * 60_000;
+
+type Failure =
+  | { mode: 'error'; status: number }
+  | { mode: 'delay' | 'jitter'; delayMs: number }
+  | { mode: 'hang' };
+
+function intParam(url: URL, name: string, fallback: number, min: number, max: number): number {
+  const n = Number(url.searchParams.get(name) ?? fallback);
+  return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.round(n))) : fallback;
+}
 
 /**
  * Failure injection for health-check testing. `?fail=backend-b` (a
  * comma-separated list, or `*` for every backend) makes the named backend
- * answer with `?failStatus` (default 503) instead of 200. A name can also be
- * an instance id, which fails just that instance: one endpoint of a backend
- * with several, the case outlier detection acts on. It's per request and
- * stateless, so it works through the proxy: only requests that carry it
- * fail, and only where the name matches.
+ * misbehave instead of answering normally. A name can also be an instance id,
+ * which fails just that instance: one endpoint of a backend with several, the
+ * case outlier detection acts on. It's per request and stateless, so it works
+ * through the proxy: only requests that carry it fail, and only where the
+ * name matches.
+ *
+ * `?failMode` picks how it misbehaves:
+ *   error   (default) answer `?failStatus` (5xx, default 503)
+ *   delay   answer 200 after `?delayMs` (default 1000)
+ *   jitter  answer 200 after a random delay in `?jitterMin`..`?jitterMax` (default 100..2000)
+ *   hang    never answer, to exercise the proxy's timeout
+ * `?failPercent` (0-100, default 100) applies it to only that share of
+ * matching requests; the rest answer normally, like a flaky-not-dead origin.
  */
-function failureFor(url: URL, id: string): number | null {
+function failureFor(url: URL, id: string): Failure | null {
   const fail = url.searchParams.get('fail');
   if (!fail) return null;
   const targets = fail.split(',').map((s) => s.trim());
   if (!targets.includes('*') && !targets.includes(id) && !targets.includes(instanceId)) return null;
-  const requested = Number(url.searchParams.get('failStatus') ?? 503);
-  return Number.isInteger(requested) && requested >= 500 && requested <= 599 ? requested : 503;
+
+  const percent = intParam(url, 'failPercent', 100, 0, 100);
+  if (Math.random() * 100 >= percent) return null;
+
+  switch (url.searchParams.get('failMode')) {
+    case 'delay':
+      return { mode: 'delay', delayMs: intParam(url, 'delayMs', 1000, 0, MAX_DELAY_MS) };
+    case 'jitter': {
+      const min = intParam(url, 'jitterMin', 100, 0, MAX_DELAY_MS);
+      const max = Math.max(min, intParam(url, 'jitterMax', 2000, 0, MAX_DELAY_MS));
+      return { mode: 'jitter', delayMs: Math.floor(min + Math.random() * (max - min)) };
+    }
+    case 'hang':
+      return { mode: 'hang' };
+    default: {
+      const requested = Number(url.searchParams.get('failStatus') ?? 503);
+      const status = Number.isInteger(requested) && requested >= 500 && requested <= 599 ? requested : 503;
+      return { mode: 'error', status };
+    }
+  }
+}
+
+// Waits `ms`, or until the client goes away, whichever comes first.
+function wait(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener('abort', () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
 }
 
 export async function OPTIONS() {
   return new NextResponse(null, { status: 204, headers: corsHeaders });
 }
 
-function handle(req: NextRequest) {
+async function handle(req: NextRequest) {
   requestCount += 1;
   const headers = Object.fromEntries(req.headers.entries());
   const id = backendId();
   const url = new URL(req.url);
-  const failStatus = failureFor(url, id);
+  const failure = failureFor(url, id);
+  const idHeaders = { ...corsHeaders, 'x-backend-id': id, 'x-instance-id': instanceId };
 
-  if (failStatus !== null) {
+  if (failure?.mode === 'error') {
     return NextResponse.json(
-      { backendId: id, instanceId, failed: true, status: failStatus, servedAt: new Date().toISOString() },
-      { status: failStatus, headers: { ...corsHeaders, 'x-backend-id': id, 'x-instance-id': instanceId } },
+      { backendId: id, instanceId, failed: true, failMode: 'error', status: failure.status, servedAt: new Date().toISOString() },
+      { status: failure.status, headers: { ...idHeaders, 'x-fail-mode': 'error' } },
     );
   }
+
+  if (failure?.mode === 'hang') {
+    // Hold the request open without answering. If the client or proxy gives
+    // up first there's no one left to answer; past the cap, close it with a
+    // 504 so the instance doesn't collect stuck requests.
+    await wait(MAX_HANG_MS, req.signal);
+    return NextResponse.json(
+      { backendId: id, instanceId, failed: true, failMode: 'hang', servedAt: new Date().toISOString() },
+      { status: 504, headers: { ...idHeaders, 'x-fail-mode': 'hang' } },
+    );
+  }
+
+  if (failure) await wait(failure.delayMs, req.signal);
 
   const body = {
     backendId: id,
@@ -82,11 +148,13 @@ function handle(req: NextRequest) {
     lbKey: headers['x-lb-key'] ?? null,
     method: req.method,
     path: url.pathname,
+    // Present only when a delay or jitter was applied to this request.
+    ...(failure && { failMode: failure.mode, delayedMs: failure.delayMs }),
     headers,
   };
 
   return NextResponse.json(body, {
-    headers: { ...corsHeaders, 'x-backend-id': id, 'x-instance-id': instanceId },
+    headers: failure ? { ...idHeaders, 'x-fail-mode': failure.mode } : idHeaders,
   });
 }
 
