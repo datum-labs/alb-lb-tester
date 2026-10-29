@@ -58,10 +58,11 @@ Open the dashboard, enter your **proxy hostname** (e.g. `https://your-alb.datump
 | ConsistentHash on header, spread | Same manifest, key mode **Random** | Requests spread across backends |
 | ConsistentHash on source IP | SourceIP manifest, key mode None | All requests stick to one backend (one client IP) |
 | Passive health checks | Health-check manifest, **Health checks** tab, fail one backend | Target ejected after ~5 failures, retried after 30s, re-admitted once failures stop |
+| Timeouts & retries | **Timeouts & retries** tab, one Compute instance, Hang | Each request shows whether the proxy waited, retried elsewhere, or returned its own error, and after how long |
 
 ## Features
 
-The dashboard has four tabs, all driven by the shared proxy URL at the top.
+The dashboard has five tabs, all driven by the shared proxy URL at the top.
 
 **Load balancing** — fire a burst (or a continuous **Live** stream with a rolling req/s meter) and see:
 - Distribution bars per backend, with **expected-vs-observed** deltas when you enter the weights you configured
@@ -89,6 +90,13 @@ Requests go through the server-side probe so a 503 the proxy generates itself (n
 Outlier detection ejects **endpoints within a backend**. It doesn't move traffic between backends: a backend whose every endpoint fails keeps its weighted share. So failing a whole Vercel backend (one app behind shared anycast IPs) will always report *not ejected*, and that's the expected result.
 
 To see an ejection, fail one endpoint of a backend that has several. Run the tester as a **Datum Compute workload with 3 instances** and add it to the load balancer as a Datum compute backend (see `examples/health-check-compute.yaml`). Three instances rather than two: with max ejected at 50% one of three can go, and the other two keep the backend well above the proxy's panic threshold, where it would ignore health and route to every endpoint.
+
+**Timeouts & retries** — makes one backend or instance **hang**, answer after a **delay**, or answer **5xx**, and shows what the proxy did with each request. Every endpoint gets the same request and only the target misbehaves, so each response says what happened:
+- the target answered: the proxy **waited** for it, or passed its 5xx on
+- another endpoint answered, but more than a second slower than baseline: the proxy tried the target, gave up, and **retried** elsewhere
+- no origin answered: the proxy **gave up** and returned its own error (status and how long it waited)
+
+It reports these counts, the target's share against baseline, a latency plot of every request, and a per-request table. Keep **Give up after** longer than the proxy's own timeout, so the run sees the proxy give up rather than the dashboard. A 5xx the proxy retries at once can't be told apart by timing from a request that never went to the target; a drop in the target's share is the sign of it.
 
 ## Failure injection
 

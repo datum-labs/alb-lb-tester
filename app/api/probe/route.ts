@@ -7,6 +7,12 @@ import { NextRequest, NextResponse } from 'next/server';
 // ours, so a proxy-generated error can be told apart from an origin's.
 export const dynamic = 'force-dynamic';
 export const runtime = 'nodejs';
+export const maxDuration = 100;
+
+// Long enough for a normal request. The timeouts test raises it (?timeoutMs=)
+// past the proxy's own timeout, so it sees the proxy give up, not the probe.
+const DEFAULT_TIMEOUT_MS = 12_000;
+const MAX_TIMEOUT_MS = 90_000;
 
 export async function GET(req: NextRequest) {
   const target = req.nextUrl.searchParams.get('url');
@@ -16,9 +22,11 @@ export async function GET(req: NextRequest) {
   } catch {
     return NextResponse.json({ error: 'Invalid url' }, { status: 400 });
   }
+  const asked = Number(req.nextUrl.searchParams.get('timeoutMs'));
+  const timeoutMs = asked > 0 ? Math.min(MAX_TIMEOUT_MS, Math.floor(asked)) : DEFAULT_TIMEOUT_MS;
 
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 12000);
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   const t0 = Date.now();
   try {
     const res = await fetch(target, { redirect: 'manual', cache: 'no-store', signal: ctrl.signal });
