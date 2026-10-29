@@ -3,13 +3,19 @@
  *
  * A run has three phases at a steady request rate:
  *   baseline  — nothing fails; confirms the target backend gets traffic
- *   failing   — requests carry ?fail=<target>, so only the target answers 5xx
+ *   failing   — requests carry ?fail=<target>&failMode=…, so only the target
+ *               misbehaves: answers 5xx, answers late, or hangs
  *   recovery  — failures stop; watches for the target to be re-admitted
  *
  * With outlier detection on, the proxy should stop sending the target traffic
  * after a run of 5xx (ejection), try it again when the ejection period ends
  * (and eject it again, for longer, while it's still failing), and serve it
  * normally once it's healthy and re-admitted.
+ *
+ * A target that hangs, or answers later than the proxy waits, never answers at
+ * all: the proxy returns its own 504. Only the target misbehaves, so a failing-
+ * phase request in those modes that gets a proxy 504 is counted as a timeout
+ * on the target (the dashboard sets its unit to the target).
  */
 
 export type Phase = 'baseline' | 'failing' | 'recovery';
@@ -26,21 +32,29 @@ export type HealthSample = {
   /**
    * What the test tracks this sample under: the backend id, or for the
    * target's backend when one instance is failed, "<backend>·<instance>".
+   * Set to the target for a proxy 504 the target's timeout caused.
    */
   unit: string | null;
   status: number;
+  /** How long the request took. A slow or hung failure only counts once it ends. */
+  ms: number;
 };
 
-export type Outcome = 'ok' | 'target-5xx' | 'backend-5xx' | 'proxy-5xx' | 'error' | 'other';
+export type Outcome = 'ok' | 'target-5xx' | 'target-timeout' | 'backend-5xx' | 'proxy-5xx' | 'error' | 'other';
 
 export function outcomeOf(sample: HealthSample, target: string): Outcome {
   if (sample.status === 0) return 'error';
   if (sample.status >= 200 && sample.status < 400) return 'ok';
   if (sample.status >= 500) {
-    if (!sample.backendId) return 'proxy-5xx';
+    if (!sample.backendId) return sample.unit === target ? 'target-timeout' : 'proxy-5xx';
     return sample.unit === target ? 'target-5xx' : 'backend-5xx';
   }
   return 'other';
+}
+
+/** The target failed this request: answered 5xx, or made the proxy time out. */
+export function isTargetFailure(outcome: Outcome): boolean {
+  return outcome === 'target-5xx' || outcome === 'target-timeout';
 }
 
 export type Bucket = {
@@ -49,6 +63,7 @@ export type Bucket = {
   /** 2xx/3xx responses per unit (backend, or instance of the target's backend). */
   ok: Map<string, number>;
   target5xx: number;
+  targetTimeouts: number;
   backend5xx: number;
   proxy5xx: number;
   errors: number;
@@ -75,6 +90,7 @@ export function bucketize(
     phase: phaseAt(second, baselineS, failingS),
     ok: new Map(),
     target5xx: 0,
+    targetTimeouts: 0,
     backend5xx: 0,
     proxy5xx: 0,
     errors: 0,
@@ -92,6 +108,9 @@ export function bucketize(
         break;
       case 'target-5xx':
         bucket.target5xx += 1;
+        break;
+      case 'target-timeout':
+        bucket.targetTimeouts += 1;
         break;
       case 'backend-5xx':
         bucket.backend5xx += 1;
@@ -131,10 +150,14 @@ export type HealthVerdict = {
   baselineShare: number;
   /** Seconds into the failing phase when the target stopped receiving traffic. */
   ejectedAfterS: number | null;
-  /** Target 5xx responses before it was ejected. */
+  /** Target failures (5xx or timeouts) before it was ejected. */
   failuresBeforeEject: number | null;
-  /** Target 5xx responses across the whole failing phase. */
+  /** Target failures across the whole failing phase. */
   targetFailures: number;
+  /** Of those, how many were the proxy timing out on the target. */
+  targetTimeouts: number;
+  /** Requests the target answered normally while it was meant to be failing. */
+  targetOkFailing: number;
   /** Times the target got traffic again, still failing, after being ejected. */
   retriesWhileFailing: number;
   /** Share of failing-phase requests that reached the target. */
@@ -226,9 +249,11 @@ export function analyse(
     baselineShare,
     ejectedAfterS: firstEjection ? firstEjection.start - failStart : null,
     failuresBeforeEject: firstEjection
-      ? failing.filter((s) => s.t < firstEjection.start * 1000 && outcomeOf(s, target) === 'target-5xx').length
+      ? failing.filter((s) => s.t + s.ms < firstEjection.start * 1000 && isTargetFailure(outcomeOf(s, target))).length
       : null,
-    targetFailures: failing.filter((s) => outcomeOf(s, target) === 'target-5xx').length,
+    targetFailures: failing.filter((s) => isTargetFailure(outcomeOf(s, target))).length,
+    targetTimeouts: failing.filter((s) => outcomeOf(s, target) === 'target-timeout').length,
+    targetOkFailing: failing.filter((s) => s.unit === target && outcomeOf(s, target) === 'ok').length,
     retriesWhileFailing,
     targetShareFailing: failing.length ? failing.filter((s) => s.unit === target).length / failing.length : 0,
     readmittedAfterS: readmit ? Math.max(0, readmit.t / 1000 - failEnd) : null,
@@ -236,7 +261,7 @@ export function analyse(
     rateTooLow,
     clearlyNotEjected:
       !firstEjection &&
-      failing.filter((s) => outcomeOf(s, target) === 'target-5xx').length >= FAILURES_TO_RULE_OUT_EJECTION &&
+      failing.filter((s) => isTargetFailure(outcomeOf(s, target))).length >= FAILURES_TO_RULE_OUT_EJECTION &&
       (failing.length ? failing.filter((s) => s.unit === target).length / failing.length : 0) >=
         baselineShare * 0.5,
     proxy5xx: samples.filter((s) => outcomeOf(s, target) === 'proxy-5xx').length,
