@@ -23,6 +23,13 @@ import {
   type HealthSample,
   type Phase,
 } from './health-analysis';
+import {
+  analyse as analyseTimeouts,
+  outcomeOf as timeoutOutcomeOf,
+  type TimeoutOutcome,
+  type TimeoutPhase,
+  type TimeoutSample,
+} from './timeout-analysis';
 
 type Result = {
   n: number;
@@ -82,7 +89,8 @@ function download(name: string, text: string) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-type TabId = 'load' | 'inspect' | 'waf' | 'health';
+type TabId = 'load' | 'inspect' | 'waf' | 'health' | 'timeouts';
+const TAB_IDS: TabId[] = ['load', 'inspect', 'waf', 'health', 'timeouts'];
 const TAB_STORAGE_KEY = 'alb-tester:tab';
 
 export function Dashboard() {
@@ -95,7 +103,7 @@ export function Dashboard() {
   useEffect(() => {
     try {
       const saved = localStorage.getItem(TAB_STORAGE_KEY);
-      if (saved === 'load' || saved === 'inspect' || saved === 'waf' || saved === 'health') setTab(saved);
+      if (TAB_IDS.includes(saved as TabId)) setTab(saved as TabId);
     } catch {}
   }, []);
   useEffect(() => {
@@ -133,6 +141,7 @@ export function Dashboard() {
           <TabsTrigger value="inspect">Headers &amp; redirect</TabsTrigger>
           <TabsTrigger value="waf">WAF probes</TabsTrigger>
           <TabsTrigger value="health">Health checks</TabsTrigger>
+          <TabsTrigger value="timeouts">Timeouts &amp; retries</TabsTrigger>
         </TabsList>
 
         {/* forceMount keeps all panels in the DOM; <Activity> preserves each
@@ -158,6 +167,12 @@ export function Dashboard() {
         <TabsContent value="health" forceMount className="mt-4 data-[state=inactive]:hidden">
           <Activity mode={tab === 'health' ? 'visible' : 'hidden'}>
             <HealthTab base={base} target={target} item={item} container={container} />
+          </Activity>
+        </TabsContent>
+
+        <TabsContent value="timeouts" forceMount className="mt-4 data-[state=inactive]:hidden">
+          <Activity mode={tab === 'timeouts' ? 'visible' : 'hidden'}>
+            <TimeoutsTab base={base} target={target} item={item} container={container} />
           </Activity>
         </TabsContent>
       </Tabs>
@@ -683,6 +698,102 @@ function unitFor(target: string, backendId: string | null, instanceId: string | 
   return backendId;
 }
 
+type ProbeResult = { status: number; ms: number; backendId: string | null; instanceId: string | null };
+
+/**
+ * Probe server-side: a 5xx the proxy generates itself has no CORS headers, so
+ * the browser couldn't read it (or tell it apart from a backend's). timeoutMs
+ * raises the probe's own limit, for requests expected to outlast the default.
+ */
+async function probe(url: string, timeoutMs?: number): Promise<ProbeResult> {
+  const query = new URLSearchParams({ url });
+  if (timeoutMs) query.set('timeoutMs', String(timeoutMs));
+  try {
+    const res = await fetch(`/api/probe?${query}`, { cache: 'no-store' });
+    const data = await res.json();
+    return {
+      status: typeof data.status === 'number' ? data.status : 0,
+      ms: typeof data.ms === 'number' ? data.ms : 0,
+      backendId: (data.backendId as string | null) ?? null,
+      instanceId: (data.instanceId as string | null) ?? null,
+    };
+  } catch {
+    return { status: 0, ms: 0, backendId: null, instanceId: null };
+  }
+}
+
+type Detected = { backends: string[]; instances: string[] };
+
+/** Lists the backends behind the proxy, and the instances of any backend with several. */
+function useDetect(target: (p?: string) => string) {
+  const [detected, setDetected] = useState<Detected>({ backends: [], instances: [] });
+  const [detecting, setDetecting] = useState(false);
+
+  async function detect(): Promise<Detected> {
+    setDetecting(true);
+    // Enough requests to see each instance of a backend with a few of them.
+    const results = await Promise.all(Array.from({ length: 40 }, (_, n) => {
+      const url = new URL(target());
+      url.searchParams.set('_', String(n));
+      return probe(url.toString());
+    }));
+    const backends = [...new Set(results.map((r) => r.backendId).filter((id): id is string => !!id))].sort();
+    const instancesBy = new Map<string, Set<string>>();
+    for (const r of results) {
+      if (!r.backendId || !r.instanceId) continue;
+      instancesBy.set(r.backendId, (instancesBy.get(r.backendId) ?? new Set()).add(r.instanceId));
+    }
+    // Only a backend with more than one instance has a single endpoint to fail.
+    const instances = [...instancesBy.entries()]
+      .filter(([, ids]) => ids.size > 1)
+      .flatMap(([backend, ids]) => [...ids].sort().map((id) => `${backend}${INSTANCE_SEP}${id}`));
+    const found = { backends, instances };
+    setDetected(found);
+    setDetecting(false);
+    return found;
+  }
+
+  return { detected, detecting, detect };
+}
+
+function TargetPicker({
+  id, label, value, onChange, detected, detecting, onDetect, disabled,
+}: {
+  id: string; label: string; value: string; onChange: (v: string) => void;
+  detected: Detected; detecting: boolean; onDetect: () => void; disabled: boolean;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <Label htmlFor={id}>{label}</Label>
+      <div className="flex gap-2">
+        <Input id={id} value={value} onChange={(e) => onChange(e.target.value)} placeholder="backend-b or compute·ab12cd" className="flex-1" disabled={disabled} />
+        <Button theme="outline" loading={detecting} onClick={onDetect} disabled={disabled}>Detect</Button>
+      </div>
+      {detected.backends.length > 0 && (
+        <div className="space-y-1.5 pt-1">
+          {([['Backends', detected.backends], ['Instances', detected.instances]] as const).map(([group, ids]) =>
+            ids.length === 0 ? null : (
+              <div key={group} className="flex flex-wrap items-center gap-1.5">
+                <span className="text-muted-foreground w-16 text-[11px]">{group}</span>
+                {ids.map((option) => (
+                  <button key={option} type="button" disabled={disabled} onClick={() => onChange(option)}
+                    className="rounded-md border px-2 py-0.5 font-mono text-xs transition-colors disabled:opacity-50"
+                    style={value === option ? { borderColor: 'var(--destructive)', background: 'color-mix(in oklch, var(--destructive) 12%, var(--card))' } : undefined}>
+                    {option}
+                  </button>
+                ))}
+              </div>
+            ),
+          )}
+          {detected.instances.length === 0 && (
+            <p className="text-muted-foreground text-[11px]">No backend answered from more than one instance, so there&rsquo;s no single endpoint to fail.</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function HealthTab({
   base, target, item, container,
 }: { base: string; target: (p?: string) => string; item: Variants; container: Variants }) {
@@ -692,8 +803,7 @@ function HealthTab({
   const [baselineS, setBaselineS] = useState(10);
   const [failingS, setFailingS] = useState(40);
   const [recoveryS, setRecoveryS] = useState(70);
-  const [detected, setDetected] = useState<{ backends: string[]; instances: string[] }>({ backends: [], instances: [] });
-  const [detecting, setDetecting] = useState(false);
+  const { detected, detecting, detect: detectTargets } = useDetect(target);
   const [running, setRunning] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [samples, setSamples] = useState<HealthSample[]>([]);
@@ -702,22 +812,6 @@ function HealthTab({
   const [note, setNote] = useState<string | null>(null);
   const cancel = useRef(false);
   const store = useRef<HealthSample[]>([]);
-
-  // Probe server-side: a 503 the proxy generates itself has no CORS headers,
-  // so the browser couldn't read it (or tell it apart from a backend's 503).
-  async function probe(url: string) {
-    try {
-      const res = await fetch(`/api/probe?url=${encodeURIComponent(url)}`, { cache: 'no-store' });
-      const data = await res.json();
-      return {
-        status: typeof data.status === 'number' ? data.status : 0,
-        backendId: (data.backendId as string | null) ?? null,
-        instanceId: (data.instanceId as string | null) ?? null,
-      };
-    } catch {
-      return { status: 0, backendId: null, instanceId: null };
-    }
-  }
 
   function requestUrl(n: number, failing: boolean, id: string) {
     const url = new URL(target());
@@ -733,23 +827,10 @@ function HealthTab({
 
   async function detect() {
     if (!base) { setNote('Enter the proxy base URL above first.'); return; }
-    setDetecting(true); setNote(null);
-    // Enough requests to see each instance of a backend with a few of them.
-    const results = await Promise.all(Array.from({ length: 40 }, (_, n) => probe(requestUrl(n, false, ''))));
-    const backends = [...new Set(results.map((r) => r.backendId).filter((id): id is string => !!id))].sort();
-    const instancesBy = new Map<string, Set<string>>();
-    for (const r of results) {
-      if (!r.backendId || !r.instanceId) continue;
-      instancesBy.set(r.backendId, (instancesBy.get(r.backendId) ?? new Set()).add(r.instanceId));
-    }
-    // Only a backend with more than one instance has an endpoint to eject.
-    const instances = [...instancesBy.entries()]
-      .filter(([, ids]) => ids.size > 1)
-      .flatMap(([backend, ids]) => [...ids].sort().map((id) => `${backend}${INSTANCE_SEP}${id}`));
-    setDetected({ backends, instances });
+    setNote(null);
+    const { backends, instances } = await detectTargets();
     if (!backends.length) setNote('No backend answered. Check the proxy URL and path.');
     else if (!failTarget) setFailTarget(instances[0] ?? backends[backends.length - 1]);
-    setDetecting(false);
   }
 
   async function run() {
@@ -890,34 +971,8 @@ function HealthTab({
             Outlier detection ejects endpoints within a backend, so to see it work, fail one <span className="text-foreground font-medium">instance</span> of a backend that has several (a Datum Compute workload with 3 instances). Failing a whole backend shows it keeping its weighted share.
           </p>
 
-          <div className="space-y-1.5">
-            <Label htmlFor="hc-target">Backend or instance to fail</Label>
-            <div className="flex gap-2">
-              <Input id="hc-target" value={failTarget} onChange={(e) => setFailTarget(e.target.value)} placeholder="backend-b or compute·ab12cd" className="flex-1" disabled={running} />
-              <Button theme="outline" loading={detecting} onClick={detect} disabled={running}>Detect</Button>
-            </div>
-            {detected.backends.length > 0 && (
-              <div className="space-y-1.5 pt-1">
-                {([['Backends', detected.backends], ['Instances', detected.instances]] as const).map(([label, ids]) =>
-                  ids.length === 0 ? null : (
-                    <div key={label} className="flex flex-wrap items-center gap-1.5">
-                      <span className="text-muted-foreground w-16 text-[11px]">{label}</span>
-                      {ids.map((id) => (
-                        <button key={id} type="button" disabled={running} onClick={() => setFailTarget(id)}
-                          className="rounded-md border px-2 py-0.5 font-mono text-xs transition-colors disabled:opacity-50"
-                          style={failTarget === id ? { borderColor: 'var(--destructive)', background: 'color-mix(in oklch, var(--destructive) 12%, var(--card))' } : undefined}>
-                          {id}
-                        </button>
-                      ))}
-                    </div>
-                  ),
-                )}
-                {detected.instances.length === 0 && (
-                  <p className="text-muted-foreground text-[11px]">No backend answered from more than one instance, so there&rsquo;s no single endpoint to fail.</p>
-                )}
-              </div>
-            )}
-          </div>
+          <TargetPicker id="hc-target" label="Backend or instance to fail" value={failTarget} onChange={setFailTarget}
+            detected={detected} detecting={detecting} onDetect={detect} disabled={running} />
 
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-1.5">
@@ -1088,6 +1143,349 @@ function HealthTab({
                 <motion.p variants={item} className="text-muted-foreground text-xs">
                   {verdict?.errors} requests failed before a response (timeout or network error).
                 </motion.p>
+              )}
+            </motion.div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------- Timeouts tab */
+
+type SlowMode = 'hang' | 'delay' | 'error';
+const SLOW_MODES: { value: SlowMode; label: string }[] = [
+  { value: 'hang', label: 'Hang — never answer' },
+  { value: 'delay', label: 'Delay — answer late' },
+  { value: 'error', label: 'Error — answer 5xx' },
+];
+const OUTCOME_STYLE: Record<TimeoutOutcome, { label: string; color: string; badge: 'success' | 'warning' | 'info' | 'danger' | 'muted' | 'secondary' }> = {
+  ok: { label: 'answered normally', color: 'var(--chart-2)', badge: 'success' },
+  waited: { label: 'proxy waited for target', color: 'var(--chart-4)', badge: 'warning' },
+  retried: { label: 'retried elsewhere', color: 'var(--chart-1)', badge: 'info' },
+  'origin-error': { label: 'origin 5xx', color: 'var(--destructive)', badge: 'danger' },
+  'proxy-error': { label: 'proxy gave up', color: 'var(--foreground)', badge: 'danger' },
+  'no-response': { label: 'no response', color: 'var(--muted-foreground)', badge: 'muted' },
+  other: { label: 'other', color: 'var(--chart-3)', badge: 'secondary' },
+};
+const secs = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+
+function TimeoutsTab({
+  base, target, item, container,
+}: { base: string; target: (p?: string) => string; item: Variants; container: Variants }) {
+  const [failTarget, setFailTarget] = useState('');
+  const [mode, setMode] = useState<SlowMode>('hang');
+  const [delayS, setDelayS] = useState(20);
+  const [failStatus, setFailStatus] = useState(503);
+  const [rps, setRps] = useState(2);
+  const [baselineS, setBaselineS] = useState(10);
+  const [slowS, setSlowS] = useState(30);
+  const [giveUpS, setGiveUpS] = useState(60);
+  const { detected, detecting, detect: detectTargets } = useDetect(target);
+  const [running, setRunning] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const [samples, setSamples] = useState<TimeoutSample[]>([]);
+  // Settings of the run on screen, so editing the form doesn't re-analyse it.
+  const [runConfig, setRunConfig] = useState<{
+    target: string; mode: SlowMode; delayS: number; failStatus: number; baselineS: number; slowS: number; giveUpS: number;
+  } | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+  const cancel = useRef(false);
+  const store = useRef<TimeoutSample[]>([]);
+
+  async function detect() {
+    if (!base) { setNote('Enter the proxy base URL above first.'); return; }
+    setNote(null);
+    const { backends, instances } = await detectTargets();
+    if (!backends.length) setNote('No backend answered. Check the proxy URL and path.');
+    else if (!failTarget) setFailTarget(instances[0] ?? backends[backends.length - 1]);
+  }
+
+  async function run() {
+    if (!base) { setNote('Enter the proxy base URL above first.'); return; }
+    const id = failTarget.trim();
+    if (!id) { setNote('Choose a backend or instance to slow down. Use Detect to list them.'); return; }
+    const rate = Math.max(1, Math.min(20, Math.floor(rps)));
+    const b = Math.max(1, Math.floor(baselineS));
+    const s = Math.max(1, Math.floor(slowS));
+    const giveUp = Math.max(1, Math.min(90, Math.floor(giveUpS)));
+    const delay = Math.max(1, Math.min(60, Math.floor(delayS)));
+    const totalMs = (b + s) * 1000;
+
+    setRunning(true); setNote(null); setSamples([]); setElapsed(0);
+    setRunConfig({ target: id, mode, delayS: delay, failStatus, baselineS: b, slowS: s, giveUpS: giveUp });
+    store.current = [];
+    cancel.current = false;
+
+    const { backend, instance } = splitTarget(id);
+    const requestUrl = (n: number, slow: boolean) => {
+      const url = new URL(target());
+      if (slow) {
+        url.searchParams.set('fail', instance ?? backend);
+        url.searchParams.set('failMode', mode);
+        if (mode === 'delay') url.searchParams.set('delayMs', String(delay * 1000));
+        if (mode === 'error') url.searchParams.set('failStatus', String(failStatus));
+      }
+      url.searchParams.set('_', String(n));
+      return url.toString();
+    };
+
+    const start = performance.now();
+    const inflight = new Set<Promise<void>>();
+    let n = 0;
+    const flush = setInterval(() => {
+      setSamples(store.current.slice());
+      setElapsed((performance.now() - start) / 1000);
+    }, 500);
+
+    await new Promise<void>((resolve) => {
+      const stop = startTicker(1000 / rate, () => {
+        const t = performance.now() - start;
+        if (cancel.current || t >= totalMs) {
+          stop();
+          resolve();
+          return;
+        }
+        const phase: TimeoutPhase = t < b * 1000 ? 'baseline' : 'slow';
+        const index = n++;
+        const job = probe(requestUrl(index, phase === 'slow'), giveUp * 1000).then((res) => {
+          store.current.push({
+            n: index, t, phase,
+            backendId: res.backendId, instanceId: res.instanceId,
+            unit: unitFor(id, res.backendId, res.instanceId),
+            status: res.status, ms: res.ms,
+          });
+        });
+        inflight.add(job);
+        void job.finally(() => inflight.delete(job));
+      });
+    });
+
+    // Slow requests are still out; wait for them to answer or give up.
+    await Promise.all(inflight);
+    clearInterval(flush);
+    store.current.sort((a, x) => a.n - x.n);
+    setSamples(store.current.slice());
+    setElapsed((performance.now() - start) / 1000);
+    setRunning(false);
+  }
+
+  const cfg = runConfig;
+  const verdict = useMemo(
+    () => (cfg ? analyseTimeouts(samples, cfg.target, cfg.baselineS, cfg.slowS) : null),
+    [samples, cfg],
+  );
+  const outcomeFor = (s: TimeoutSample) => timeoutOutcomeOf(s, cfg?.target ?? '', verdict?.retryAfterMs ?? Infinity);
+  const finished = !running && !!cfg && samples.length > 0;
+  const totalMs = cfg ? (cfg.baselineS + cfg.slowS) * 1000 : 1;
+  const maxMs = Math.max(1000, (verdict?.retryAfterMs ?? 0), ...samples.map((s) => s.ms)) * 1.15;
+  const slowRows = samples.filter((s) => s.phase === 'slow');
+  const pct = (share: number) => `${(share * 100).toFixed(0)}%`;
+
+  const summary = (() => {
+    if (!verdict || !cfg || !finished) return null;
+    if (verdict.baselineToTarget === 0) {
+      return {
+        tone: 'bad' as const,
+        text: `No baseline requests reached "${cfg.target}". Check the backend id${verdict.baselineBackends.length ? ` (seen: ${verdict.baselineBackends.join(', ')})` : ''}.`,
+      };
+    }
+    const c = verdict.counts;
+    const behaviour = cfg.mode === 'hang' ? 'hung' : cfg.mode === 'delay' ? `answered after ${cfg.delayS}s` : `answered ${cfg.failStatus}`;
+    const parts = [`${verdict.toTarget} of ${verdict.slowCount} requests went to "${cfg.target}" while it ${behaviour}.`];
+    parts.push(c.retried
+      ? `The proxy retried ${c.retried} on another endpoint (median ${secs(verdict.retriedMs!)} in all).`
+      : 'The proxy retried none of them on another endpoint.');
+    if (c['proxy-error'] && verdict.proxyWaitMs) {
+      const statuses = verdict.proxyStatuses.map((p) => p.status).join('/');
+      const { p50, min, max } = verdict.proxyWaitMs;
+      const wait = max - min < 500 ? secs(p50) : `${secs(min)}–${secs(max)}`;
+      parts.push(`It gave up on ${c['proxy-error']}, returning its own ${statuses} after ${wait}.`);
+    }
+    if (c.waited) parts.push(`It waited for the target on ${c.waited} (median ${secs(verdict.waitedMs!)}).`);
+    if (verdict.targetErrors) parts.push(`It passed ${verdict.targetErrors} of the target's own 5xx responses on to the client.`);
+    if (c['no-response']) parts.push(`${c['no-response']} got no response within ${cfg.giveUpS}s.`);
+    const clientSawFailure = c['proxy-error'] + verdict.targetErrors + c['no-response'] > 0;
+    return { tone: clientSawFailure ? ('warn' as const) : ('good' as const), text: parts.join(' ') };
+  })();
+  const toneColor = { good: 'var(--chart-2)', warn: 'var(--chart-4)', bad: 'var(--chart-5)' } as const;
+
+  return (
+    <div className="grid items-start gap-4 md:grid-cols-[340px_1fr]">
+      <Card>
+        <CardHeader><CardTitle className="text-sm">Timeouts &amp; retries test</CardTitle></CardHeader>
+        <CardContent className="space-y-4">
+          <p className="text-muted-foreground text-xs">
+            Makes one backend or instance hang, answer late, or answer 5xx, then shows for each request whether the proxy waited for it, gave up with its own error, or retried on another endpoint.
+          </p>
+          <p className="text-muted-foreground text-xs">
+            Fail one <span className="text-foreground font-medium">instance</span> of a backend with several, so a retry has somewhere else to go.
+          </p>
+
+          <TargetPicker id="to-target" label="Backend or instance to slow down" value={failTarget} onChange={setFailTarget}
+            detected={detected} detecting={detecting} onDetect={detect} disabled={running} />
+
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1.5">
+              <Label>Behaviour</Label>
+              <Select value={mode} onValueChange={(v) => setMode(v as SlowMode)} disabled={running}>
+                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  {SLOW_MODES.map((m) => <SelectItem key={m.value} value={m.value}>{m.label}</SelectItem>)}
+                </SelectContent>
+              </Select>
+            </div>
+            {mode === 'delay' && (
+              <div className="space-y-1.5">
+                <Label htmlFor="to-delay">Delay s</Label>
+                <Input id="to-delay" type="number" min={1} max={60} value={delayS} onChange={(e) => setDelayS(+e.target.value)} disabled={running} />
+              </div>
+            )}
+            {mode === 'error' && (
+              <div className="space-y-1.5">
+                <Label>Status</Label>
+                <Select value={String(failStatus)} onValueChange={(v) => setFailStatus(+v)} disabled={running}>
+                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {FAIL_STATUSES.map((code) => <SelectItem key={code} value={String(code)}>{code}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1.5">
+              <Label htmlFor="to-rps">Requests / s</Label>
+              <Input id="to-rps" type="number" min={1} max={20} value={rps} onChange={(e) => setRps(+e.target.value)} disabled={running} />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="to-giveup">Give up after s</Label>
+              <Input id="to-giveup" type="number" min={1} max={90} value={giveUpS} onChange={(e) => setGiveUpS(+e.target.value)} disabled={running} />
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1.5">
+              <Label htmlFor="to-b">Baseline s</Label>
+              <Input id="to-b" type="number" min={1} value={baselineS} onChange={(e) => setBaselineS(+e.target.value)} disabled={running} />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="to-s">Slow s</Label>
+              <Input id="to-s" type="number" min={1} value={slowS} onChange={(e) => setSlowS(+e.target.value)} disabled={running} />
+            </div>
+          </div>
+          <p className="text-muted-foreground text-xs">
+            The dashboard stops waiting after &ldquo;give up after&rdquo; and counts the request as no response. Keep it longer than the proxy&rsquo;s timeout so you see the proxy give up, not the dashboard.
+          </p>
+
+          {!running ? (
+            <Button block onClick={run}>Run timeouts test</Button>
+          ) : (
+            <Button block theme="outline" onClick={() => (cancel.current = true)}>
+              Stop · {elapsed.toFixed(0)}s
+            </Button>
+          )}
+          {samples.length > 0 && !running && (
+            <Button block theme="link" onClick={() => download('alb-timeouts-results.csv',
+              'n,t_ms,phase,backendId,instanceId,status,ms,outcome\n' + samples.map((s) => `${s.n},${s.t.toFixed(0)},${s.phase},${s.backendId ?? ''},${s.instanceId ?? ''},${s.status},${s.ms},${outcomeFor(s)}`).join('\n'))}>
+              Export CSV
+            </Button>
+          )}
+          {note && <p className="text-destructive text-xs">{note}</p>}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader><CardTitle className="text-sm">Results</CardTitle></CardHeader>
+        <CardContent>
+          {!cfg || samples.length === 0 ? (
+            <div className="text-muted-foreground py-12 text-center text-sm">
+              {running ? 'Starting…' : 'No run yet. Pick a backend to slow down and run the test.'}
+            </div>
+          ) : (
+            <motion.div className="space-y-5" variants={container} initial="hidden" animate="show">
+              <motion.div variants={item} className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
+                <Stat n={verdict?.counts.retried ?? 0} label="Retried elsewhere" tone={verdict?.counts.retried ? 'var(--chart-2)' : undefined} />
+                <Stat
+                  n={verdict?.proxyWaitMs
+                    ? <>{verdict.counts['proxy-error']}<Unit> · {verdict.proxyStatuses[0].status} at {secs(verdict.proxyWaitMs.p50)}</Unit></>
+                    : verdict?.counts['proxy-error'] ?? 0}
+                  label="Proxy gave up"
+                />
+                <Stat n={verdict?.targetErrors ?? 0} label="Origin 5xx passed on" />
+                <Stat
+                  n={verdict ? <>{pct(verdict.targetShareSlow)}<Unit> vs {pct(verdict.baselineShare)}</Unit></> : '—'}
+                  label="Share to target vs baseline"
+                />
+              </motion.div>
+
+              {summary && (
+                <motion.div variants={item} className="space-y-1.5 rounded-md border px-3 py-2.5 text-sm"
+                  style={{ borderColor: toneColor[summary.tone], background: `color-mix(in oklch, ${toneColor[summary.tone]} 12%, var(--card))` }}>
+                  <p>{summary.text}</p>
+                  {cfg.mode === 'error' && summary.tone !== 'bad' && (
+                    <p className="text-muted-foreground text-xs">
+                      A 5xx retried at once looks like a normal answer from another endpoint. Compare the target&rsquo;s share while failing with its baseline share: a big drop means the proxy retried or ejected it.
+                    </p>
+                  )}
+                </motion.div>
+              )}
+
+              <motion.div variants={item}>
+                <SectionLabel>Latency <span className="text-muted-foreground/70 normal-case">— each request, by when it was sent</span></SectionLabel>
+                <div className="bg-card relative h-40 overflow-hidden rounded border">
+                  <div className="absolute inset-y-0 left-0" style={{ width: `${(cfg.baselineS * 1000 / totalMs) * 100}%`, background: PHASE_TINT.baseline }} />
+                  {verdict && (
+                    <div className="absolute inset-x-0 border-t border-dashed" style={{ bottom: `${(verdict.retryAfterMs / maxMs) * 100}%`, borderColor: 'var(--muted-foreground)' }}
+                      title={`Slower than ${secs(verdict.retryAfterMs)} from another endpoint counts as a retry`} />
+                  )}
+                  {samples.map((s) => (
+                    <div key={s.n} className="absolute size-1.5 -translate-x-1/2 translate-y-1/2 rounded-full"
+                      style={{ left: `${Math.min(100, (s.t / totalMs) * 100)}%`, bottom: `${(s.ms / maxMs) * 100}%`, background: OUTCOME_STYLE[outcomeFor(s)].color }}
+                      title={`#${s.n} · ${s.status || 'no response'} · ${secs(s.ms)} · ${s.unit ?? 'proxy'}`} />
+                  ))}
+                  <span className="text-muted-foreground absolute left-1 top-0.5 text-[10px]">{secs(maxMs)}</span>
+                </div>
+                <div className="text-muted-foreground mt-1.5 flex text-[10.5px]">
+                  <div style={{ width: `${(cfg.baselineS * 1000 / totalMs) * 100}%` }} className="truncate">Baseline</div>
+                  <div className="truncate">Slow</div>
+                </div>
+                <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs">
+                  {(Object.keys(OUTCOME_STYLE) as TimeoutOutcome[])
+                    .filter((o) => samples.some((s) => outcomeFor(s) === o))
+                    .map((o) => <span key={o}><Dot color={OUTCOME_STYLE[o].color} />{OUTCOME_STYLE[o].label}</span>)}
+                  <span className="text-muted-foreground">┄ retry threshold</span>
+                </div>
+              </motion.div>
+
+              {slowRows.length > 0 && (
+                <motion.div variants={item}>
+                  <SectionLabel>Slow-phase requests</SectionLabel>
+                  <div className="max-h-72 overflow-auto">
+                    <table className="w-full text-xs tabular-nums">
+                      <thead><tr className="text-muted-foreground text-left">
+                        <Th>#</Th><Th>Sent</Th><Th>Status</Th><Th>Took</Th><Th>Answered by</Th><Th>What happened</Th>
+                      </tr></thead>
+                      <tbody>
+                        {slowRows.map((s) => {
+                          const outcome = outcomeFor(s);
+                          return (
+                            <tr key={s.n}>
+                              <Td>{s.n}</Td>
+                              <Td>{secs(s.t)}</Td>
+                              <Td>{s.status || '—'}</Td>
+                              <Td>{secs(s.ms)}</Td>
+                              <Td className="font-mono">{s.unit ? `${s.unit}${s.unit === cfg.target ? ' (target)' : ''}` : s.status ? 'proxy' : '—'}</Td>
+                              <Td><Badge type={OUTCOME_STYLE[outcome].badge} className="whitespace-nowrap">{OUTCOME_STYLE[outcome].label}</Badge></Td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </motion.div>
               )}
             </motion.div>
           )}
