@@ -650,6 +650,20 @@ function WafTab({ base, path, item, container }: { base: string; path: string; i
 
 const FAIL_STATUSES = [500, 502, 503, 504];
 
+type HealthMode = 'error' | 'delay' | 'jitter' | 'hang';
+const HEALTH_MODES: { value: HealthMode; label: string }[] = [
+  { value: 'error', label: 'Error — answer 5xx' },
+  { value: 'delay', label: 'Delay — answer late' },
+  { value: 'jitter', label: 'Jitter — answer after a random delay' },
+  { value: 'hang', label: 'Hang — never answer' },
+];
+/**
+ * How long the dashboard waits on a request in the slow modes: past the
+ * proxy's own timeout (15s on Datum), so the proxy's 504 comes back instead of
+ * the dashboard giving up first.
+ */
+const SLOW_GIVE_UP_MS = 30_000;
+
 /**
  * A timer that holds its rate in a background tab. Page timers there are
  * throttled to about one tick a second (less after a few minutes), which
@@ -798,7 +812,12 @@ function HealthTab({
   base, target, item, container,
 }: { base: string; target: (p?: string) => string; item: Variants; container: Variants }) {
   const [failTarget, setFailTarget] = useState('');
+  const [mode, setMode] = useState<HealthMode>('error');
   const [failStatus, setFailStatus] = useState(503);
+  const [delayS, setDelayS] = useState(5);
+  const [jitterMinS, setJitterMinS] = useState(0.1);
+  const [jitterMaxS, setJitterMaxS] = useState(2);
+  const [failPercent, setFailPercent] = useState(100);
   const [rps, setRps] = useState(10);
   const [baselineS, setBaselineS] = useState(10);
   const [failingS, setFailingS] = useState(40);
@@ -808,18 +827,27 @@ function HealthTab({
   const [elapsed, setElapsed] = useState(0);
   const [samples, setSamples] = useState<HealthSample[]>([]);
   // Settings of the run on screen, so editing the form doesn't re-analyse it.
-  const [runConfig, setRunConfig] = useState<{ target: string; baselineS: number; failingS: number; totalS: number; rate: number } | null>(null);
+  const [runConfig, setRunConfig] = useState<{
+    target: string; mode: HealthMode; failPercent: number; baselineS: number; failingS: number; totalS: number; rate: number;
+  } | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const cancel = useRef(false);
   const store = useRef<HealthSample[]>([]);
 
-  function requestUrl(n: number, failing: boolean, id: string) {
+  function requestUrl(n: number, failing: boolean, id: string, percent: number) {
     const url = new URL(target());
     if (failing) {
       // The origin matches ?fail= against its backend id or its instance id.
       const { backend, instance } = splitTarget(id);
       url.searchParams.set('fail', instance ?? backend);
-      url.searchParams.set('failStatus', String(failStatus));
+      url.searchParams.set('failMode', mode);
+      if (mode === 'error') url.searchParams.set('failStatus', String(failStatus));
+      if (mode === 'delay') url.searchParams.set('delayMs', String(Math.round(delayS * 1000)));
+      if (mode === 'jitter') {
+        url.searchParams.set('jitterMin', String(Math.round(jitterMinS * 1000)));
+        url.searchParams.set('jitterMax', String(Math.round(jitterMaxS * 1000)));
+      }
+      if (percent < 100) url.searchParams.set('failPercent', String(percent));
     }
     url.searchParams.set('_', String(n));
     return url.toString();
@@ -841,10 +869,12 @@ function HealthTab({
     const b = Math.max(1, Math.floor(baselineS));
     const f = Math.max(1, Math.floor(failingS));
     const r = Math.max(1, Math.floor(recoveryS));
+    const percent = Math.max(1, Math.min(100, Math.floor(failPercent)));
     const totalMs = (b + f + r) * 1000;
+    const giveUpMs = mode === 'error' ? undefined : SLOW_GIVE_UP_MS;
 
     setRunning(true); setNote(null); setSamples([]); setElapsed(0);
-    setRunConfig({ target: id, baselineS: b, failingS: f, totalS: b + f + r, rate });
+    setRunConfig({ target: id, mode, failPercent: percent, baselineS: b, failingS: f, totalS: b + f + r, rate });
     store.current = [];
     cancel.current = false;
 
@@ -869,12 +899,19 @@ function HealthTab({
         }
         const phase: Phase = t < b * 1000 ? 'baseline' : t < (b + f) * 1000 ? 'failing' : 'recovery';
         const index = n++;
-        const job = probe(requestUrl(index, phase === 'failing', id)).then((res) => {
+        const job = probe(requestUrl(index, phase === 'failing', id, percent), giveUpMs).then((res) => {
+          // Only the target misbehaves, so while it's slow or hanging a 504 the
+          // proxy generated itself is the proxy timing out on the target.
+          const timedOut = phase === 'failing' && mode !== 'error' && !res.backendId && res.status === 504;
+          // When the request actually reached the proxy. The browser holds
+          // only a few connections to the dashboard, so while some hang, new
+          // requests queue behind them and leave later than they were made.
+          const sentAt = Math.max(t, performance.now() - start - res.ms);
           store.current.push({
-            n: index, t, phase,
+            n: index, t: sentAt, phase,
             backendId: res.backendId, instanceId: res.instanceId,
-            unit: unitFor(id, res.backendId, res.instanceId),
-            status: res.status,
+            unit: timedOut ? id : unitFor(id, res.backendId, res.instanceId),
+            status: res.status, ms: res.ms,
           });
         });
         inflight.add(job);
@@ -940,6 +977,9 @@ function HealthTab({
         text: `Inconclusive: requests ran well below ${cfg.rate}/s (baseline / failing / recovery: ${rates} req/s), too few to judge an ejection. Run it again and keep this tab open, or raise the rate.`,
       };
     }
+    const failures = verdict.targetTimeouts === verdict.targetFailures
+      ? 'proxy timeouts'
+      : verdict.targetTimeouts > 0 ? 'failures (5xx and proxy timeouts)' : '5xx responses';
     if (verdict.ejectedAfterS !== null) {
       const retries = verdict.retriesWhileFailing > 0
         ? ` The proxy tried it again ${verdict.retriesWhileFailing} ${verdict.retriesWhileFailing === 1 ? 'time' : 'times'} while it was still failing.`
@@ -949,12 +989,14 @@ function HealthTab({
         : ` It was re-admitted ${verdict.readmittedAfterS.toFixed(0)}s after the failures stopped.`;
       return {
         tone: 'good' as const,
-        text: `Ejected: "${cfg.target}" stopped receiving traffic ${verdict.ejectedAfterS}s into the failure window, after ${verdict.failuresBeforeEject} 5xx responses.${retries}${readmit}`,
+        text: `Ejected: "${cfg.target}" stopped receiving traffic ${verdict.ejectedAfterS}s into the failure window, after ${verdict.failuresBeforeEject} ${failures}.${retries}${readmit}`,
       };
     }
     return {
       tone: 'bad' as const,
-      text: `Not ejected: "${cfg.target}" kept ${pct(verdict.targetShareFailing)} of requests while failing (${pct(verdict.baselineShare)} at baseline) and returned ${verdict.targetFailures} 5xx responses.`,
+      text: verdict.targetFailures === 0 && verdict.targetOkFailing > 0
+        ? `Not ejected: "${cfg.target}" kept ${pct(verdict.targetShareFailing)} of requests while slow (${pct(verdict.baselineShare)} at baseline) and answered all ${verdict.targetOkFailing} of them before the proxy timed out, so none counted as a failure.`
+        : `Not ejected: "${cfg.target}" kept ${pct(verdict.targetShareFailing)} of requests while failing (${pct(verdict.baselineShare)} at baseline) with ${verdict.targetFailures} ${failures}${verdict.targetOkFailing ? ` and ${verdict.targetOkFailing} normal answers` : ''}.`,
     };
   })();
   const toneColor = { good: 'var(--chart-2)', warn: 'var(--chart-4)', bad: 'var(--chart-5)' } as const;
@@ -965,7 +1007,7 @@ function HealthTab({
         <CardHeader><CardTitle className="text-sm">Health check test</CardTitle></CardHeader>
         <CardContent className="space-y-4">
           <p className="text-muted-foreground text-xs">
-            Makes one backend, or one instance of a backend, answer 5xx for a while, then watches whether the proxy stops sending it traffic (ejection) and when it comes back (re-admission). Needs outlier detection on the load balancer.
+            Makes one backend, or one instance of a backend, fail for a while (answer 5xx, answer late, or hang), then watches whether the proxy stops sending it traffic (ejection) and when it comes back (re-admission). Needs outlier detection on the load balancer.
           </p>
           <p className="text-muted-foreground text-xs">
             Outlier detection ejects endpoints within a backend, so to see it work, fail one <span className="text-foreground font-medium">instance</span> of a backend that has several (a Datum Compute workload with 3 instances). Failing a whole backend shows it keeping its weighted share.
@@ -974,20 +1016,59 @@ function HealthTab({
           <TargetPicker id="hc-target" label="Backend or instance to fail" value={failTarget} onChange={setFailTarget}
             detected={detected} detecting={detecting} onDetect={detect} disabled={running} />
 
+          <div className="space-y-1.5">
+            <Label>How it fails</Label>
+            <Select value={mode} onValueChange={(v) => setMode(v as HealthMode)} disabled={running}>
+              <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {HEALTH_MODES.map((m) => <SelectItem key={m.value} value={m.value}>{m.label}</SelectItem>)}
+              </SelectContent>
+            </Select>
+          </div>
+
           <div className="grid grid-cols-2 gap-3">
+            {mode === 'error' && (
+              <div className="space-y-1.5">
+                <Label>Status</Label>
+                <Select value={String(failStatus)} onValueChange={(v) => setFailStatus(+v)} disabled={running}>
+                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {FAIL_STATUSES.map((code) => <SelectItem key={code} value={String(code)}>{code}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
+            {mode === 'delay' && (
+              <div className="space-y-1.5">
+                <Label htmlFor="hc-delay">Delay s</Label>
+                <Input id="hc-delay" type="number" min={0} max={60} step={0.5} value={delayS} onChange={(e) => setDelayS(+e.target.value)} disabled={running} />
+              </div>
+            )}
+            {mode === 'jitter' && (
+              <div className="space-y-1.5">
+                <Label htmlFor="hc-jmin">Delay range s</Label>
+                <div className="flex items-center gap-1.5">
+                  <Input id="hc-jmin" aria-label="Shortest delay s" type="number" min={0} max={60} step={0.1} value={jitterMinS} onChange={(e) => setJitterMinS(+e.target.value)} disabled={running} />
+                  <span className="text-muted-foreground text-xs">–</span>
+                  <Input aria-label="Longest delay s" type="number" min={0} max={60} step={0.1} value={jitterMaxS} onChange={(e) => setJitterMaxS(+e.target.value)} disabled={running} />
+                </div>
+              </div>
+            )}
+            {mode === 'hang' && <div />}
             <div className="space-y-1.5">
-              <Label htmlFor="hc-rps">Requests / s</Label>
-              <Input id="hc-rps" type="number" min={1} max={50} value={rps} onChange={(e) => setRps(+e.target.value)} disabled={running} />
+              <Label htmlFor="hc-pct">Fail % of requests</Label>
+              <Input id="hc-pct" type="number" min={1} max={100} value={failPercent} onChange={(e) => setFailPercent(+e.target.value)} disabled={running} />
             </div>
-            <div className="space-y-1.5">
-              <Label>Fail with</Label>
-              <Select value={String(failStatus)} onValueChange={(v) => setFailStatus(+v)} disabled={running}>
-                <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
-                <SelectContent>
-                  {FAIL_STATUSES.map((code) => <SelectItem key={code} value={String(code)}>{code}</SelectItem>)}
-                </SelectContent>
-              </Select>
-            </div>
+          </div>
+          {mode !== 'error' && (
+            <p className="text-muted-foreground text-xs">
+              A slow answer only counts as a failure if the proxy times out first (15s on Datum) and answers 504 itself; that 504 is counted as a timeout on the target. Each slow request holds a connection until it ends, and run locally over HTTP/1.1 the browser keeps only 6 open to the dashboard, so keep the rate low.
+            </p>
+          )}
+
+          <div className="space-y-1.5">
+            <Label htmlFor="hc-rps">Requests / s</Label>
+            <Input id="hc-rps" type="number" min={1} max={50} value={rps} onChange={(e) => setRps(+e.target.value)} disabled={running} />
           </div>
 
           <div className="grid grid-cols-3 gap-3">
@@ -1040,7 +1121,7 @@ function HealthTab({
                   label="Ejected after"
                   tone={trusted?.ejectedAfterS != null ? 'var(--chart-2)' : undefined}
                 />
-                <Stat n={trusted?.failuresBeforeEject ?? '—'} label="5xx before eject" />
+                <Stat n={trusted?.failuresBeforeEject ?? '—'} label="Failures before eject" />
                 <Stat
                   n={verdict ? <>{pct(verdict.targetShareFailing)}<Unit> vs {pct(verdict.baselineShare)}</Unit></> : '—'}
                   label="Share failing vs baseline"
@@ -1065,6 +1146,9 @@ function HealthTab({
                       ) : (
                         <>
                           <li>Outlier detection is off, or its 5xx threshold is higher than the failures this run sent.</li>
+                          {cfg.failPercent < 100 && (
+                            <li>Only {cfg.failPercent}% of the target&rsquo;s requests failed. Outlier detection counts 5xx <em>in a row</em>, so a normal answer between failures resets the count.</li>
+                          )}
                           <li>Every edge proxy counts consecutive 5xx on its own. Spread across several proxies, no single one may have seen enough in a row; a higher rate or longer failing phase helps.</li>
                           <li>With max ejected at 50%, a backend with two instances can eject one; with fewer healthy than the proxy&rsquo;s panic threshold it routes to all of them anyway. Three or more instances avoids both.</li>
                         </>
@@ -1084,6 +1168,7 @@ function HealthTab({
                     const segments: { key: string; value: number; color: string }[] = [
                       ...[...b.ok.entries()].map(([id, value]) => ({ key: id, value, color: colorFor(id) })),
                       { key: 'target-5xx', value: b.target5xx, color: 'var(--destructive)' },
+                      { key: 'target-timeout', value: b.targetTimeouts, color: 'var(--chart-4)' },
                       { key: 'backend-5xx', value: b.backend5xx, color: 'var(--chart-5)' },
                       { key: 'proxy-5xx', value: b.proxy5xx, color: 'var(--foreground)' },
                       { key: 'errors', value: b.errors, color: 'var(--muted-foreground)' },
@@ -1115,6 +1200,7 @@ function HealthTab({
                     <span key={id} className="font-mono"><Dot color={colorFor(id)} />{id}{id === cfg.target ? ' (target)' : ''}</span>
                   ))}
                   <span><Dot color="var(--destructive)" />target 5xx</span>
+                  {buckets.some((b) => b.targetTimeouts > 0) && <span><Dot color="var(--chart-4)" />proxy timed out on target</span>}
                   <span><Dot color="var(--foreground)" />proxy 5xx</span>
                   {trusted?.ejectedAfterS != null && <span className="text-muted-foreground">│ ejected (no traffic where ~5 requests were expected)</span>}
                 </div>

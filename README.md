@@ -58,6 +58,7 @@ Open the dashboard, enter your **proxy hostname** (e.g. `https://your-alb.datump
 | ConsistentHash on header, spread | Same manifest, key mode **Random** | Requests spread across backends |
 | ConsistentHash on source IP | SourceIP manifest, key mode None | All requests stick to one backend (one client IP) |
 | Passive health checks | Health-check manifest, **Health checks** tab, fail one backend | Target ejected after ~5 failures, retried after 30s, re-admitted once failures stop |
+| Health checks: slow, hang, flaky | **Health checks** tab, *How it fails*: Delay, Jitter, Hang, or *Fail %* under 100, RoundRobin proxy | Hang ejects after ~5 proxy timeouts; a delay under the proxy timeout is never ejected; a partial failure ejects only once 5 fail in a row |
 | Timeouts & retries | **Timeouts & retries** tab, one Compute instance, Hang | Each request shows whether the proxy waited, retried elsewhere, or returned its own error, and after how long |
 
 ## Features
@@ -77,13 +78,17 @@ The dashboard has five tabs, all driven by the shared proxy URL at the top.
 
 **WAF probes** — sends a set of XSS, SQLi, command-injection and traversal payloads plus benign requests, and reports the block rate, any false positives, and a per-payload table.
 
-**Health checks** — makes one backend, or one instance of a backend, fail and checks outlier detection. **Detect** lists the backends behind the proxy and, for any backend answering from more than one instance, its instances; pick one to fail. The run sends a steady stream in three phases: *baseline* (nothing fails), *failing* (requests carry `?fail=<backend or instance>`, so only that one returns 5xx), and *recovery*. It reports:
-- When the target was **ejected** (no traffic to it for a stretch in which, at its baseline share, it should have had several requests) and how many 5xx it returned first
+**Health checks** — makes one backend, or one instance of a backend, fail and checks outlier detection. **Detect** lists the backends behind the proxy and, for any backend answering from more than one instance, its instances; pick one to fail. The run sends a steady stream in three phases: *baseline* (nothing fails), *failing* (requests carry `?fail=<backend or instance>`, so only that one misbehaves), and *recovery*. **How it fails** picks the failure: answer **5xx** (pick the status), answer after a **delay** or a random delay in a range (**jitter**), or **hang**. **Fail %** fails only that share of the target's requests, for a flaky-not-dead endpoint. It reports:
+- When the target was **ejected** (no traffic to it for a stretch in which, at its baseline share, it should have had several requests) and how many failures it returned first
 - How often the proxy **retried** it while it was still failing, each time an ejection period ended
 - How long after the failures stopped it was **re-admitted**
 - A per-second timeline of which backend or instance answered, with target 5xx and proxy-generated 5xx marked, and each one's share per phase
 
 Requests go through the server-side probe so a 503 the proxy generates itself (no CORS headers) is still counted, and told apart from the backend's own 503. A run that falls well below the requested rate is reported as inconclusive unless it still has enough failures to decide.
+
+In the slow modes a request only counts as a failure if the proxy gives up on it first (15s on Datum) and returns its own 504. Only the target misbehaves, so that 504 is counted as a **timeout on the target**, at the time the proxy gave up. A delay shorter than the proxy's timeout is just a slow 200: passive health checks don't eject for latency, and the run says so. Two things to know for slow-mode runs:
+- **Use a RoundRobin load balancer.** With LeastRequest the proxy already sends less traffic to an endpoint that has requests stuck on it, which looks like an ejection before there is one.
+- **Keep the rate low when running locally** (2–3 req/s). Over HTTP/1.1 the browser holds only 6 connections to the dashboard, so hung requests make the rest queue. Each request is timed from when it actually left, so the results stay right, but the timeline shows gaps and bursts.
 
 ### What outlier detection does, and how to test it
 
