@@ -1,0 +1,35 @@
+# Failover between the instances of one backend: the tester running as a
+# Datum Compute workload with 3 instances, with passive health checks tuned
+# to take a failing instance out of rotation quickly.
+#
+# HTTPProxy has no fallback backend, and health checks never move traffic
+# between backends, so failover happens between the endpoints of a backend.
+# Run 3 instances so one can be ejected (max 50%) while the other two keep
+# the backend above the proxy's panic threshold.
+#
+# To test it, open the Health checks tab, Detect, pick one instance, and run.
+# Expect:
+#   - Error (5xx): ejected about 1s in, after 3 failures. Clients see those
+#     3 errors, then the other two instances serve everything.
+#   - Hang: ejected after 3 proxy timeouts, about 18s in. Each of those
+#     requests waits the proxy's 15s timeout before getting a 504.
+#   - The ejected instance is let back in after 10s. If it's still failing
+#     it's ejected again, for longer each time (10s, 20s, 30s...), so it can
+#     take 20-30s after it recovers to get its share back.
+#
+# The networkService name and port come from the workload's NetworkService.
+apiVersion: networking.datumapis.com/v1alpha
+kind: HTTPProxy
+metadata:
+  name: lb-tester-failover-compute
+spec:
+  healthCheck:
+    passive:
+      consecutive5xxErrors: 3
+      baseEjectionTime: 10s
+      maxEjectionPercent: 50
+  rules:
+    - backends:
+        - networkService:
+            name: alb-lb-tester
+            port: http
