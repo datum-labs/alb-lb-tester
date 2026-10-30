@@ -59,6 +59,7 @@ Open the dashboard, enter your **proxy hostname** (e.g. `https://your-alb.datump
 | ConsistentHash on source IP | SourceIP manifest, key mode None | All requests stick to one backend (one client IP) |
 | Passive health checks | Health-check manifest, **Health checks** tab, fail one backend | Target ejected after ~5 failures, retried after 30s, re-admitted once failures stop |
 | Health checks: slow, hang, flaky | **Health checks** tab, *How it fails*: Delay, Jitter, Hang, or *Fail %* under 100, RoundRobin proxy | Hang ejects after ~5 proxy timeouts; a delay under the proxy timeout is never ejected; a partial failure ejects only once 5 fail in a row |
+| Failover between instances | `failover-compute.yaml`, **Health checks** tab, fail one of 3 Compute instances | 5xx: ejected ~1s in after 3 failures; hang: ejected after 3 proxy timeouts (~18s); let back in once it recovers |
 | Timeouts & retries | **Timeouts & retries** tab, one Compute instance, Hang | Each request shows whether the proxy waited, retried elsewhere, or returned its own error, and after how long |
 
 ## Features
@@ -94,7 +95,7 @@ In the slow modes a request only counts as a failure if the proxy gives up on it
 
 Outlier detection ejects **endpoints within a backend**. It doesn't move traffic between backends: a backend whose every endpoint fails keeps its weighted share. So failing a whole Vercel backend (one app behind shared anycast IPs) will always report *not ejected*, and that's the expected result.
 
-To see an ejection, fail one endpoint of a backend that has several. Run the tester as a **Datum Compute workload with 3 instances** and add it to the load balancer as a Datum compute backend (see `examples/health-check-compute.yaml`). Three instances rather than two: with max ejected at 50% one of three can go, and the other two keep the backend well above the proxy's panic threshold, where it would ignore health and route to every endpoint.
+To see an ejection, fail one endpoint of a backend that has several. For failover, `examples/failover-compute.yaml` tunes the same settings to eject after 3 failures for 10s. HTTPProxy has no primary/fallback backend, so failover is always between the instances of one backend. Run the tester as a **Datum Compute workload with 3 instances** and add it to the load balancer as a Datum compute backend (see `examples/health-check-compute.yaml`). Three instances rather than two: with max ejected at 50% one of three can go, and the other two keep the backend well above the proxy's panic threshold, where it would ignore health and route to every endpoint.
 
 **Timeouts & retries** — makes one backend or instance **hang**, answer after a **delay**, or answer **5xx**, and shows what the proxy did with each request. Every endpoint gets the same request and only the target misbehaves, so each response says what happened:
 - the target answered: the proxy **waited** for it, or passed its 5xx on
