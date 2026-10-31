@@ -9,7 +9,7 @@
     "start": "next start"
   },
   "dependencies": {
-    "@datum-cloud/datum-ui": "^2.9.1",
+    "@datum-cloud/datum-ui": "^3.7.0",
     "lucide-react": "^1.46.0",
     "motion": "^13.3.0",
     "next": "16.4.1",
