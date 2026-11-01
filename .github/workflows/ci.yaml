@@ -10,6 +10,6 @@ permissions:
 
 jobs:
   ci:
-    uses: datum-cloud/actions/.github/workflows/ci-basic.yaml@c4bc6bcfe15b08d87cb02202f4071616d9106e72
+    uses: datum-cloud/actions/.github/workflows/ci-basic.yaml@de6ef95ace38b69f8f7fc677c54e0f24fa6255a1
     with:
       dockerfile: Dockerfile.datum
