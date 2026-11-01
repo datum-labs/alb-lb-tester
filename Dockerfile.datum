@@ -4,7 +4,7 @@
 # an x86_64 binary with its loader and shared libraries in that stage, and with
 # no WORKDIR the command runs as written rather than through a shell.
 
-FROM node:26-bookworm-slim AS build
+FROM node:26-trixie-slim AS build
 WORKDIR /src
 RUN npm install -g bun@1.3.3
 COPY package.json bun.lock ./
@@ -20,7 +20,7 @@ RUN mkdir -p /out/app \
 
 # Node plus the shared libraries it links against, and nothing else: no shell,
 # no package manager, a small root filesystem to hold in RAM.
-FROM gcr.io/distroless/nodejs22-debian12
+FROM gcr.io/distroless/nodejs26-debian13
 COPY --from=build /out/app /app
 # Next's standalone server listens on $HOSTNAME. Compute instances get IPv6
 # addresses only, so bind "::" (every interface, IPv6 and IPv4); "0.0.0.0" is
