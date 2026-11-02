@@ -6,12 +6,11 @@
 
 FROM node:26-trixie-slim AS build
 WORKDIR /src
-RUN npm install -g bun@1.3.3
-COPY package.json bun.lock ./
-RUN bun install --frozen-lockfile
+COPY package.json package-lock.json ./
+RUN npm ci
 COPY . .
 ENV NEXT_OUTPUT=standalone NEXT_TELEMETRY_DISABLED=1
-RUN bun run build
+RUN npm run build
 # The standalone server plus the static assets it serves itself.
 RUN mkdir -p /out/app \
   && cp -r .next/standalone/. /out/app/ \

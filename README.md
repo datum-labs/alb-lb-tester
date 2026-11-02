@@ -22,7 +22,7 @@ Deploy this repo as **two or three separate Vercel projects**, each with a disti
 | alb-tester-c | `backend-c` | `https://alb-tester-c.vercel.app` |
 
 ```bash
-bun add -g vercel
+npm install -g vercel
 vercel --prod -e BACKEND_ID=backend-a   # repeat per project
 ```
 
@@ -166,7 +166,7 @@ docker run -p 3000:3000 -e BACKEND_ID=local ghcr.io/datum-labs/alb-lb-tester:con
 Built with Next.js 16, React 19, Tailwind v4, and the @datum-cloud/datum-ui design system.
 
 ```bash
-bun install
-bun run dev
+npm ci
+npm run dev
 # open http://localhost:3000
 ```

@@ -17,7 +17,7 @@ on:
       - 'Dockerfile.datum'
       - 'next.config.mjs'
       - 'package.json'
-      - 'bun.lock'
+      - 'package-lock.json'
       - '.github/workflows/compute-image.yml'
   workflow_dispatch:
 
