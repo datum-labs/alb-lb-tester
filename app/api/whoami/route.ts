@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { foldHeaders, parseHeaderLines } from '../../header-diff';
 
 // Always run per-request; never cache. Load balancing is only observable if
 // every request actually reaches an origin.
@@ -100,22 +101,79 @@ function wait(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+/**
+ * Response headers asked for with `?respHeader=Name:Value` (repeatable), so a
+ * test can see what the edge does to headers an origin sends: Server,
+ * Set-Cookie, Cache-Control, CORS and so on. They replace this origin's own
+ * header of the same name. Framing and connection headers are refused, and
+ * the count and length are capped.
+ */
+function responseHeaders(url: URL, own: Record<string, string>) {
+  const { headers: custom, rejected } = parseHeaderLines(url.searchParams.getAll('respHeader'));
+  const replaced = new Set(custom.map(([k]) => k));
+  const pairs: [string, string][] = [
+    ['content-type', 'application/json'],
+    ...Object.entries(own).map(([k, v]) => [k.toLowerCase(), v] as [string, string]).filter(([k]) => !replaced.has(k)),
+    ...custom,
+  ];
+  const headers = new Headers();
+  for (const [k, v] of pairs) headers.append(k, v);
+  // What this origin sends, folded the way the client will see it, so the
+  // dashboard can compare. The runtime adds framing headers (Date,
+  // Content-Length, ...) after this point.
+  return { headers, sent: foldHeaders(pairs), rejected };
+}
+
+function json(body: Record<string, unknown>, status: number, url: URL, own: Record<string, string>) {
+  const { headers, sent, rejected } = responseHeaders(url, own);
+  const full = {
+    ...body,
+    sentHeaders: sent,
+    // Added by Next after the handler returns (it appends Vary to every
+    // response), so they're not in sentHeaders.
+    runtimeHeaders: ['vary'],
+    ...(rejected.length && { rejectedRespHeaders: rejected }),
+  };
+  return new NextResponse(JSON.stringify(full), { status, headers });
+}
+
 export async function OPTIONS() {
   return new NextResponse(null, { status: 204, headers: corsHeaders });
 }
 
+/**
+ * The request headers as they arrived. With raw-headers.cjs preloaded (the
+ * Datum Compute image) that's the raw list from the socket; without it, it's
+ * what Next passes on, which may include X-Forwarded-* headers Next filled in
+ * itself.
+ */
+function receivedHeaders(req: NextRequest): { headers: Record<string, string>; raw: boolean } {
+  const stamped = req.headers.get('x-lbt-received');
+  if (stamped) {
+    try {
+      const pairs = JSON.parse(Buffer.from(stamped, 'base64').toString('utf8')) as [string, string][];
+      return { headers: foldHeaders(pairs), raw: true };
+    } catch {
+      /* fall through */
+    }
+  }
+  const headers = Object.fromEntries(req.headers.entries());
+  delete headers['x-lbt-received'];
+  return { headers, raw: false };
+}
+
 async function handle(req: NextRequest) {
   requestCount += 1;
-  const headers = Object.fromEntries(req.headers.entries());
+  const { headers, raw } = receivedHeaders(req);
   const id = backendId();
   const url = new URL(req.url);
   const failure = failureFor(url, id);
   const idHeaders = { ...corsHeaders, 'x-backend-id': id, 'x-instance-id': instanceId };
 
   if (failure?.mode === 'error') {
-    return NextResponse.json(
+    return json(
       { backendId: id, instanceId, failed: true, failMode: 'error', status: failure.status, servedAt: new Date().toISOString() },
-      { status: failure.status, headers: { ...idHeaders, 'x-fail-mode': 'error' } },
+      failure.status, url, { ...idHeaders, 'x-fail-mode': 'error' },
     );
   }
 
@@ -124,9 +182,9 @@ async function handle(req: NextRequest) {
     // up first there's no one left to answer; past the cap, close it with a
     // 504 so the instance doesn't collect stuck requests.
     await wait(MAX_HANG_MS, req.signal);
-    return NextResponse.json(
+    return json(
       { backendId: id, instanceId, failed: true, failMode: 'hang', servedAt: new Date().toISOString() },
-      { status: 504, headers: { ...idHeaders, 'x-fail-mode': 'hang' } },
+      504, url, { ...idHeaders, 'x-fail-mode': 'hang' },
     );
   }
 
@@ -151,11 +209,11 @@ async function handle(req: NextRequest) {
     // Present only when a delay or jitter was applied to this request.
     ...(failure && { failMode: failure.mode, delayedMs: failure.delayMs }),
     headers,
+    // false: headers are as Next passed them on, not as they arrived.
+    headersRaw: raw,
   };
 
-  return NextResponse.json(body, {
-    headers: failure ? { ...idHeaders, 'x-fail-mode': failure.mode } : idHeaders,
-  });
+  return json(body, 200, url, failure ? { ...idHeaders, 'x-fail-mode': failure.mode } : idHeaders);
 }
 
 export async function GET(req: NextRequest) {

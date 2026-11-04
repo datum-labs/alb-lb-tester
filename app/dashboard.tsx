@@ -7,6 +7,7 @@ import { Button } from '@datum-cloud/datum-ui/button';
 import { Input } from '@datum-cloud/datum-ui/input';
 import { Label } from '@datum-cloud/datum-ui/label';
 import { Badge } from '@datum-cloud/datum-ui/badge';
+import { Textarea } from '@datum-cloud/datum-ui/textarea';
 import { Switch } from '@datum-cloud/datum-ui/switch';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@datum-cloud/datum-ui/tabs';
 import {
@@ -30,6 +31,14 @@ import {
   type TimeoutPhase,
   type TimeoutSample,
 } from './timeout-analysis';
+import {
+  diffHeaders,
+  evidenceMarkdown,
+  forwardingReport,
+  SPOOFED_FORWARDING,
+  type Change,
+  type HeaderRow,
+} from './header-diff';
 
 type Result = {
   n: number;
@@ -472,43 +481,118 @@ function LoadTab({
 
 /* -------------------------------------------------------------- Inspect tab */
 
+type HeaderPreset = { value: string; label: string; request?: [string, string][]; response?: [string, string][] };
+
+// Presets fill the two header boxes; they're only starting points.
+const HEADER_PRESETS: HeaderPreset[] = [
+  { value: 'none', label: 'None — just inspect' },
+  { value: 'forwarding', label: 'Client address — spoofed forwarding headers', request: SPOOFED_FORWARDING },
+  { value: 'identity', label: 'Identity leak — Server, X-Powered-By', response: [['Server', 'my-origin/1.0'], ['X-Powered-By', 'my-framework']] },
+  { value: 'cookies', label: 'Cookies — two Set-Cookie headers', response: [['Set-Cookie', 'a=1; Path=/; Secure; HttpOnly'], ['Set-Cookie', 'b=2; Path=/; SameSite=Lax']] },
+  { value: 'caching', label: 'Caching — Cache-Control, ETag, Expires', response: [['Cache-Control', 'public, max-age=60'], ['ETag', '"v1"'], ['Expires', 'Wed, 01 Jan 2031 00:00:00 GMT']] },
+  { value: 'cors', label: 'CORS — Access-Control-*', response: [['Access-Control-Allow-Origin', 'https://app.example'], ['Access-Control-Allow-Credentials', 'true'], ['Vary', 'Origin']] },
+  { value: 'security', label: 'Security — HSTS, CSP, X-Frame-Options', response: [['Strict-Transport-Security', 'max-age=300'], ['Content-Security-Policy', "default-src 'self'"], ['X-Frame-Options', 'DENY']] },
+];
+
+const linesOf = (pairs?: [string, string][]) => (pairs ?? []).map(([k, v]) => `${k}: ${v}`).join('\n');
+const nonEmpty = (text: string) => text.split('\n').map((l) => l.trim()).filter(Boolean);
+
 function InspectTab({ base, target, item, container }: { base: string; target: (p?: string) => string; item: Variants; container: Variants }) {
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState<any>(null);
   const [err, setErr] = useState<string | null>(null);
+  const [preset, setPreset] = useState('none');
+  const [reqText, setReqText] = useState('');
+  const [respText, setRespText] = useState('');
+  const [ranAt, setRanAt] = useState<Date | null>(null);
+  const [inspected, setInspected] = useState('');
+  const [copied, setCopied] = useState(false);
+
+  function pickPreset(v: string) {
+    const p = HEADER_PRESETS.find((x) => x.value === v)!;
+    setPreset(v);
+    setReqText(linesOf(p.request));
+    setRespText(linesOf(p.response));
+  }
 
   async function run() {
     if (!base) { setErr('Enter the proxy base URL above first.'); return; }
-    setLoading(true); setErr(null); setData(null);
+    setLoading(true); setErr(null); setData(null); setCopied(false);
     try {
-      const res = await fetch(`/api/inspect?url=${encodeURIComponent(target())}`, { cache: 'no-store' });
+      // Response headers are asked of the origin in its own URL; request
+      // headers are sent by the inspector.
+      const u = new URL(target());
+      for (const l of nonEmpty(respText)) u.searchParams.append('respHeader', l.replace(/:\s*/, ':'));
+      const q = new URLSearchParams({ url: u.toString() });
+      for (const l of nonEmpty(reqText)) q.append('h', l);
+      const res = await fetch(`/api/inspect?${q}`, { cache: 'no-store' });
       setData(await res.json());
+      setRanAt(new Date());
+      setInspected(u.toString());
     } catch (e) { setErr(String(e)); }
     setLoading(false);
   }
 
   const get = data?.get;
+  const sent = get?.requestSent as Record<string, string> | undefined;
   const seen = get?.requestHeadersSeen as Record<string, string> | null | undefined;
+  const originSent = get?.originSent as Record<string, string> | null | undefined;
   const resp = get?.responseHeaders as Record<string, string> | undefined;
   const proxyHost = (() => { try { return new URL(base).host; } catch { return ''; } })();
   const hostSeen = seen?.host;
   const hostOverridden = hostSeen && proxyHost && hostSeen !== proxyHost;
   const hsts = resp?.['strict-transport-security'];
   const redirect = data?.redirect;
+  const rejected = [...(data?.rejectedRequestHeaders ?? []), ...(get?.rejectedRespHeaders ?? [])] as { line: string; reason: string }[];
+
+  const requestLeg = useMemo(() => (sent && seen ? diffHeaders(sent, seen) : null), [sent, seen]);
+  const runtimeHeaders = get?.originRuntimeHeaders as string[] | undefined;
+  const responseLeg = useMemo(() => (originSent && resp ? diffHeaders(originSent, resp, runtimeHeaders) : null), [originSent, resp, runtimeHeaders]);
+  const forwarding = useMemo(() => {
+    if (!sent || !seen || !SPOOFED_FORWARDING.some(([k]) => k in sent)) return null;
+    return forwardingReport(sent, seen);
+  }, [sent, seen]);
+
+  async function copyEvidence() {
+    if (!requestLeg || !ranAt) return;
+    const md = evidenceMarkdown({ at: ranAt, target: inspected, status: get.status, request: requestLeg, response: responseLeg, forwarding, rawRequest: get.originHeadersRaw === true });
+    try { await navigator.clipboard.writeText(md); setCopied(true); } catch (e) { setErr(`Couldn't copy: ${e}`); }
+  }
 
   return (
     <div className="grid items-start gap-4 md:grid-cols-[340px_1fr]">
       <Card>
         <CardHeader><CardTitle className="text-sm">Inspect</CardTitle></CardHeader>
         <CardContent className="space-y-3">
-          <p className="text-muted-foreground text-xs">Fetches the target from the server to read the Host the origin received, the response headers the proxy returned, and whether http redirects to https.</p>
+          <p className="text-muted-foreground text-xs">Fetches the target from the server and compares the headers on each side of the edge: what was sent against what the origin received, and what the origin sent back against what arrived. Also checks HSTS and whether http redirects to https.</p>
+          <div className="space-y-1.5">
+            <Label>Preset</Label>
+            <Select value={preset} onValueChange={pickPreset}>
+              <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {HEADER_PRESETS.map((p) => <SelectItem key={p.value} value={p.value}>{p.label}</SelectItem>)}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="req-headers">Request headers to send</Label>
+            <Textarea id="req-headers" rows={4} className="font-mono text-xs" placeholder="X-Forwarded-For: 1.2.3.4" value={reqText} onChange={(e) => setReqText(e.target.value)} />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="resp-headers">Origin sends back</Label>
+            <Textarea id="resp-headers" rows={4} className="font-mono text-xs" placeholder="Server: my-app" value={respText} onChange={(e) => setRespText(e.target.value)} />
+            <p className="text-muted-foreground text-[11px]">One <span className="font-mono">Name: Value</span> per line. Repeat a name to send it twice. Origin headers only work when the target is this tester's <span className="font-mono">/api/whoami</span>.</p>
+          </div>
           <Button block loading={loading} onClick={run}>Inspect target</Button>
           {err && <p className="text-destructive text-xs">{err}</p>}
         </CardContent>
       </Card>
 
       <Card>
-        <CardHeader><CardTitle className="text-sm">Response</CardTitle></CardHeader>
+        <CardHeader className="flex flex-row items-center justify-between gap-2">
+          <CardTitle className="text-sm">Response</CardTitle>
+          {requestLeg && <Button size="small" theme="outline" onClick={copyEvidence}>{copied ? 'Copied' : 'Copy as evidence'}</Button>}
+        </CardHeader>
         <CardContent>
           {!data ? (
             <div className="text-muted-foreground py-12 text-center text-sm">No inspection yet.</div>
@@ -521,6 +605,39 @@ function InspectTab({ base, target, item, container }: { base: string; target: (
                 {get.backendId && <span className="font-mono">served by {get.backendId}</span>}
                 <span className="text-muted-foreground">· {get.ms}ms</span>
               </motion.div>
+
+              {rejected.length > 0 && (
+                <motion.div variants={item} className="text-destructive space-y-0.5 text-xs">
+                  {rejected.map((r, i) => <div key={i}>Not sent: <span className="font-mono">{r.line}</span> ({r.reason})</div>)}
+                </motion.div>
+              )}
+
+              {seen && get.originHeadersRaw !== true && (
+                <motion.div variants={item} className="rounded-md px-3 py-2.5 text-xs"
+                  style={{ background: 'color-mix(in oklch, var(--chart-5) 12%, var(--card))' }}>
+                  This origin doesn't report request headers as they arrived: they're shown after Next has filled in any missing <span className="font-mono">X-Forwarded-*</span>, so a forwarding header shown as added or rewritten may come from the origin, not the edge. Run the origin from the Datum Compute image for raw headers.
+                </motion.div>
+              )}
+
+              {forwarding && (
+                <motion.div variants={item} className="space-y-3 rounded-md px-3 py-2.5 text-sm"
+                  style={{ background: `color-mix(in oklch, ${forwarding.clientAddress ? 'var(--chart-2)' : 'var(--chart-5)'} 12%, var(--card))` }}>
+                  <div><span className="text-muted-foreground">Client address: </span>{forwarding.answer}</div>
+                  <table className="w-full text-xs">
+                    <thead><tr className="text-muted-foreground text-left"><Th>Header</Th><Th>Sent</Th><Th>Origin got</Th><Th>Verdict</Th></tr></thead>
+                    <tbody>
+                      {forwarding.findings.filter((f) => f.verdict !== 'absent').map((f) => (
+                        <tr key={f.name}>
+                          <Td className="font-mono">{f.name}</Td>
+                          <Td className="font-mono break-all">{f.sent ?? '—'}</Td>
+                          <Td className="font-mono break-all">{f.received ?? '—'}</Td>
+                          <Td>{f.verdict}</Td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </motion.div>
+              )}
 
               <motion.div variants={item} className="rounded-md px-3 py-2.5 text-sm"
                 style={{ background: `color-mix(in oklch, ${hostOverridden ? 'var(--chart-2)' : 'var(--muted)'} ${hostOverridden ? '14%' : '100%'}, var(--card))` }}>
@@ -545,12 +662,57 @@ function InspectTab({ base, target, item, container }: { base: string; target: (
                 </motion.div>
               )}
 
-              {seen && <motion.div variants={item}><HeaderTable title="Request headers the origin saw" headers={seen} highlight={['host', 'x-forwarded-for', 'x-forwarded-proto', 'x-envoy-external-address', 'x-request-id']} /></motion.div>}
-              {resp && <motion.div variants={item}><HeaderTable title="Response headers from the proxy" headers={resp} highlight={['strict-transport-security', 'server', 'x-envoy-upstream-service-time']} /></motion.div>}
+              {requestLeg
+                ? <motion.div variants={item}><DiffTable title="Request" before="Sent" after="Origin got" rows={requestLeg} /></motion.div>
+                : seen && <motion.div variants={item}><HeaderTable title="Request headers the origin saw" headers={seen} highlight={['host', 'x-forwarded-for', 'x-forwarded-proto', 'x-envoy-external-address', 'x-request-id']} /></motion.div>}
+              {responseLeg
+                ? <motion.div variants={item}><DiffTable title="Response" before="Origin sent" after="Client got" rows={responseLeg} /></motion.div>
+                : resp && <motion.div variants={item}><HeaderTable title="Response headers from the proxy" headers={resp} highlight={['strict-transport-security', 'server', 'x-envoy-upstream-service-time']} /></motion.div>}
             </motion.div>
           )}
         </CardContent>
       </Card>
+    </div>
+  );
+}
+
+const CHANGE_TONE: Record<Change, string | undefined> = {
+  unchanged: undefined,
+  added: 'var(--chart-2)',
+  appended: 'var(--chart-3)',
+  rewritten: 'var(--chart-5)',
+  removed: 'var(--destructive)',
+};
+
+function DiffTable({ title, before, after, rows }: { title: string; before: string; after: string; rows: HeaderRow[] }) {
+  const edge = rows.filter((r) => !r.hop);
+  const hop = rows.filter((r) => r.hop);
+  const changes = edge.filter((r) => r.change !== 'unchanged').length;
+  const table = (list: HeaderRow[]) => (
+    <table className="w-full text-xs">
+      <thead><tr className="text-muted-foreground text-left"><Th>Header</Th><Th>Change</Th><Th>{before}</Th><Th>{after}</Th></tr></thead>
+      <tbody>
+        {list.map((r) => (
+          <tr key={r.name} className={r.change === 'unchanged' ? 'text-muted-foreground' : undefined}>
+            <Td className="font-mono align-top">{r.name}</Td>
+            <Td className="align-top"><span style={CHANGE_TONE[r.change] ? { color: CHANGE_TONE[r.change], fontWeight: 600 } : undefined}>{r.change}</span></Td>
+            <Td className="font-mono break-all whitespace-pre-line align-top">{r.before ?? '—'}</Td>
+            <Td className="font-mono break-all whitespace-pre-line align-top">{r.after ?? '—'}</Td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+  return (
+    <div>
+      <SectionLabel>{title} <span className="text-muted-foreground/70 normal-case">— {changes} {changes === 1 ? 'change' : 'changes'} by the edge</span></SectionLabel>
+      {table(edge)}
+      {hop.length > 0 && (
+        <details className="mt-2 text-xs">
+          <summary className="text-muted-foreground cursor-pointer">{hop.length} per-hop {hop.length === 1 ? 'header' : 'headers'} (change at every hop or added by the origin's runtime, not counted)</summary>
+          <div className="mt-2">{table(hop)}</div>
+        </details>
+      )}
     </div>
   );
 }

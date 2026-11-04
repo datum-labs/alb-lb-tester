@@ -16,6 +16,7 @@ RUN bun run build
 RUN mkdir -p /out/app \
   && cp -r .next/standalone/. /out/app/ \
   && cp -r .next/static /out/app/.next/static \
+  && cp raw-headers.cjs /out/app/raw-headers.cjs \
   && if [ -d public ]; then cp -r public /out/app/public; fi
 
 # Node plus the shared libraries it links against, and nothing else: no shell,
@@ -25,7 +26,9 @@ COPY --from=build /out/app /app
 # Next's standalone server listens on $HOSTNAME. Compute instances get IPv6
 # addresses only, so bind "::" (every interface, IPv6 and IPv4); "0.0.0.0" is
 # IPv4 only and leaves the edge's connections refused.
-ENV NODE_ENV=production PORT=3000 HOSTNAME=::
+# raw-headers.cjs records request headers before Next fills in X-Forwarded-*,
+# so the origin echo reports what the proxy actually sent.
+ENV NODE_ENV=production PORT=3000 HOSTNAME=:: NODE_OPTIONS="--require /app/raw-headers.cjs"
 EXPOSE 3000
 WORKDIR /
 # server.js changes into its own directory before it loads the app.
