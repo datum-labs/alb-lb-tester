@@ -1,4 +1,6 @@
+import { notFound } from 'next/navigation';
 import { Dashboard } from './dashboard';
+import { originOnly } from './origin-only';
 
 // Read the deployment identity at request time so it reflects the running
 // BACKEND_ID rather than a build-time snapshot.
@@ -24,6 +26,7 @@ function colorFor(id: string): string {
 }
 
 export default function Page() {
+  if (originOnly) notFound();
   const id = deploymentId();
   const color = colorFor(id);
 

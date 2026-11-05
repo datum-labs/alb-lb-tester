@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { foldHeaders, headersObject, parseHeaderLines, RESP_HEADER } from '../../header-diff';
+import { originOnly } from '../../origin-only';
 import { describeError, parseTarget, safeFetch } from '../../safe-fetch';
 
 // Server-side inspector: fetches the target from the serverless runtime, so it
@@ -34,6 +35,7 @@ async function timedFetch(url: string, init: Parameters<typeof safeFetch>[1]) {
 }
 
 export async function GET(req: NextRequest) {
+  if (originOnly) return new NextResponse(null, { status: 404 });
   const target = req.nextUrl.searchParams.get('url');
   if (!target) {
     return NextResponse.json({ error: 'Missing url parameter' }, { status: 400 });

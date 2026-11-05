@@ -165,7 +165,7 @@ datumctl compute deploy alb-lb-tester --image ghcr.io/datum-labs/alb-lb-tester:l
   --location us-central-1 --min 3 --http-port 3000 --env BACKEND_ID=compute
 ```
 
-The server binds `::` because Compute instances only have IPv6 addresses; an image built before that fix needs `--env HOSTNAME=::`. Each instance picks its own id at start; set `INSTANCE_ID` to name them yourself. The repository and its package are public, so the workload needs no image pull secret. A project without a network named `default` needs `--network <name> --yes`, which creates one.
+The server binds `::` because Compute instances only have IPv6 addresses; an image built before that fix needs `--env HOSTNAME=::`. Each instance picks its own id at start; set `INSTANCE_ID` to name them yourself. A deployment that only needs to be an origin, such as one behind a proxy that automated tests use, can set `ORIGIN_ONLY=1`: `/api/whoami` keeps answering, and the dashboard, `/api/inspect` and `/api/probe` return 404, so it doesn't expose public server-side fetch tools nobody there uses. The repository and its package are public, so the workload needs no image pull secret. A project without a network named `default` needs `--network <name> --yes`, which creates one.
 
 To put the dashboard behind a login, set `DASHBOARD_AUTH=user:password`. The dashboard, `/api/inspect` and `/api/probe` then need HTTP basic auth, and the inspector and probe may also reach `*.datum.internal` names, so a test can hit one instance directly. `/api/whoami` stays open, since proxies, health checks and automated tests call it. The tools only take requests from the dashboard's own pages or from clients like curl, so another site can't use your saved login.
 

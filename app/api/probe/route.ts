@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { originOnly } from '../../origin-only';
 import { describeError, parseTarget, safeFetch } from '../../safe-fetch';
 
 // Server-side single-request probe. Returns the real status code the proxy
@@ -16,6 +17,7 @@ const DEFAULT_TIMEOUT_MS = 12_000;
 const MAX_TIMEOUT_MS = 90_000;
 
 export async function GET(req: NextRequest) {
+  if (originOnly) return new NextResponse(null, { status: 404 });
   const target = req.nextUrl.searchParams.get('url');
   if (!target) return NextResponse.json({ error: 'Missing url' }, { status: 400 });
   try {
