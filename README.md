@@ -83,7 +83,7 @@ Things to know:
 - The inspector runs on the dashboard's server, so "client address" is that server's address, not your browser's. To check from your own machine, use curl (see [Headers](#headers)).
 - Origin headers need the target to be this tester's `/api/whoami`. The request comparison needs the origin to report headers as they arrived: the Datum Compute image does (`raw-headers.cjs` records them before Next fills in missing `X-Forwarded-*`); other deployments are flagged, because a forwarding header shown as added may come from Next, not the edge.
 - HTTP/2 lowercases header names and fetch doesn't keep their order, so case and order can't be checked.
-- The inspector, and the server-side probe the health checks use, only fetch `http` and `https` URLs on public addresses. Loopback, private, link-local and similar addresses are refused, after DNS and on every redirect, so the public dashboard can't be used to reach the network it runs in. `next dev` lifts this, as does `ALLOW_PRIVATE_TARGETS=1`, for testing an origin on your own machine.
+- The inspector, and the server-side probe the health checks use, only fetch `http` and `https` URLs on public addresses. Loopback, private, link-local and similar addresses are refused, after DNS and on every redirect, so the public dashboard can't be used to reach the network it runs in. `next dev` lifts this, as does `ALLOW_PRIVATE_TARGETS=1`, for testing an origin on your own machine. Behind a login (`DASHBOARD_AUTH`, see [Run on Datum Compute](#run-on-datum-compute)), they can also reach this network's instances by internal name, `<workload>-<network>-<location>-<n>.instances.datum.internal`.
 
 **WAF probes** — sends a set of XSS, SQLi, command-injection and traversal payloads plus benign requests, and reports the block rate, any false positives, and a per-payload table.
 
@@ -166,6 +166,8 @@ datumctl compute deploy alb-lb-tester --image ghcr.io/datum-labs/alb-lb-tester:l
 ```
 
 The server binds `::` because Compute instances only have IPv6 addresses; an image built before that fix needs `--env HOSTNAME=::`. Each instance picks its own id at start; set `INSTANCE_ID` to name them yourself. The repository and its package are public, so the workload needs no image pull secret. A project without a network named `default` needs `--network <name> --yes`, which creates one.
+
+To put the dashboard behind a login, set `DASHBOARD_AUTH=user:password`. The dashboard, `/api/inspect` and `/api/probe` then need HTTP basic auth, and the inspector and probe may also reach `*.datum.internal` names, so a test can hit one instance directly. `/api/whoami` stays open, since proxies, health checks and automated tests call it. The tools only take requests from the dashboard's own pages or from clients like curl, so another site can't use your saved login.
 
 ### Regular container image
 
