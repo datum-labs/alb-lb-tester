@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { describeError, parseTarget, safeFetch } from '../../safe-fetch';
 
 // Server-side single-request probe. Returns the real status code the proxy
 // gave, which the browser cannot read for cross-origin responses that lack
@@ -18,9 +19,9 @@ export async function GET(req: NextRequest) {
   const target = req.nextUrl.searchParams.get('url');
   if (!target) return NextResponse.json({ error: 'Missing url' }, { status: 400 });
   try {
-    new URL(target);
-  } catch {
-    return NextResponse.json({ error: 'Invalid url' }, { status: 400 });
+    parseTarget(target);
+  } catch (e) {
+    return NextResponse.json({ error: `Invalid url: ${e instanceof Error ? e.message : e}` }, { status: 400 });
   }
   const asked = Number(req.nextUrl.searchParams.get('timeoutMs'));
   const timeoutMs = asked > 0 ? Math.min(MAX_TIMEOUT_MS, Math.floor(asked)) : DEFAULT_TIMEOUT_MS;
@@ -29,11 +30,11 @@ export async function GET(req: NextRequest) {
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   const t0 = Date.now();
   try {
-    const res = await fetch(target, { redirect: 'manual', cache: 'no-store', signal: ctrl.signal });
+    const res = await safeFetch(target, { redirect: 'manual', signal: ctrl.signal });
     let backendId = res.headers.get('x-backend-id');
     let instanceId = res.headers.get('x-instance-id');
     try {
-      const body = await res.json();
+      const body = (await res.json()) as any;
       if (body && typeof body.backendId === 'string') backendId = body.backendId;
       if (body && typeof body.instanceId === 'string') instanceId = body.instanceId;
     } catch {
@@ -44,7 +45,7 @@ export async function GET(req: NextRequest) {
       { headers: { 'Cache-Control': 'no-store' } },
     );
   } catch (e) {
-    return NextResponse.json({ status: 0, ok: false, ms: Date.now() - t0, backendId: null, instanceId: null, error: String(e) });
+    return NextResponse.json({ status: 0, ok: false, ms: Date.now() - t0, backendId: null, instanceId: null, error: describeError(e) });
   } finally {
     clearTimeout(timer);
   }
