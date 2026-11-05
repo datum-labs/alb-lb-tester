@@ -1,5 +1,6 @@
-// DASHBOARD_AUTH=user:password puts the dashboard, the inspector and the probe
-// behind HTTP basic auth (see proxy.ts). /api/whoami stays open: it's the
+// DASHBOARD_AUTH=user:password puts the dashboard, the inspector, the probe
+// and the sticky failure API behind HTTP basic auth (see proxy.ts); without
+// it, the sticky failure API doesn't exist. /api/whoami stays open: it's the
 // origin that proxies, health checks and automated tests call.
 //
 // Behind a login, the inspector and probe may also reach this network's

@@ -1,5 +1,6 @@
 import { notFound } from 'next/navigation';
 import { Dashboard } from './dashboard';
+import { stickyAllowed } from './instance';
 import { originOnly } from './origin-only';
 
 // Read the deployment identity at request time so it reflects the running
@@ -52,7 +53,7 @@ export default function Page() {
         </div>
       </header>
 
-      <Dashboard />
+      <Dashboard stickyEnabled={stickyAllowed} />
     </div>
   );
 }

@@ -98,11 +98,12 @@ function download(name: string, text: string) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-type TabId = 'load' | 'inspect' | 'waf' | 'health' | 'timeouts';
-const TAB_IDS: TabId[] = ['load', 'inspect', 'waf', 'health', 'timeouts'];
+type TabId = 'load' | 'inspect' | 'waf' | 'health' | 'timeouts' | 'sticky';
+const TAB_IDS: TabId[] = ['load', 'inspect', 'waf', 'health', 'timeouts', 'sticky'];
 const TAB_STORAGE_KEY = 'alb-tester:tab';
 
-export function Dashboard() {
+/** stickyEnabled: the sticky failure API is on (behind DASHBOARD_AUTH, not ORIGIN_ONLY). */
+export function Dashboard({ stickyEnabled }: { stickyEnabled: boolean }) {
   const [proxyUrl, setProxyUrl] = useState('');
   const [path, setPath] = useState('/api/whoami');
   const [tab, setTab] = useState<TabId>('load');
@@ -112,9 +113,9 @@ export function Dashboard() {
   useEffect(() => {
     try {
       const saved = localStorage.getItem(TAB_STORAGE_KEY);
-      if (TAB_IDS.includes(saved as TabId)) setTab(saved as TabId);
+      if (TAB_IDS.includes(saved as TabId) && (saved !== 'sticky' || stickyEnabled)) setTab(saved as TabId);
     } catch {}
-  }, []);
+  }, [stickyEnabled]);
   useEffect(() => {
     try {
       localStorage.setItem(TAB_STORAGE_KEY, tab);
@@ -151,6 +152,7 @@ export function Dashboard() {
           <TabsTrigger value="waf">WAF probes</TabsTrigger>
           <TabsTrigger value="health">Health checks</TabsTrigger>
           <TabsTrigger value="timeouts">Timeouts &amp; retries</TabsTrigger>
+          {stickyEnabled && <TabsTrigger value="sticky">Sticky failure</TabsTrigger>}
         </TabsList>
 
         {/* forceMount keeps all panels in the DOM; <Activity> preserves each
@@ -184,6 +186,14 @@ export function Dashboard() {
             <TimeoutsTab base={base} target={target} item={item} container={container} />
           </Activity>
         </TabsContent>
+
+        {stickyEnabled && (
+          <TabsContent value="sticky" forceMount className="mt-4 data-[state=inactive]:hidden">
+            <Activity mode={tab === 'sticky' ? 'visible' : 'hidden'}>
+              <StickyTab />
+            </Activity>
+          </TabsContent>
+        )}
       </Tabs>
     </div>
   );
@@ -1736,6 +1746,237 @@ function TimeoutsTab({
                 </motion.div>
               )}
             </motion.div>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+/* --------------------------------------------------------------- Sticky tab */
+
+type StickyInfo = {
+  failMode: HealthMode; failPercent: number; failStatus?: number; delayMs?: number; jitterMin?: number; jitterMax?: number;
+  setAt: string; expiresAt: string; remainingS: number;
+};
+type StickyRow = { loading: boolean; error?: string; instanceId?: string; sticky?: StickyInfo | null; checkedAt?: number };
+
+const INSTANCE_DOMAIN = '.instances.datum.internal';
+const MAX_INSTANCES = 20;
+
+/**
+ * The instances to drive: "<prefix>-<n>.instances.datum.internal" for each n
+ * below the count, or the one host entered when it already has a dot or a
+ * port (another domain, or localhost:3001 when testing locally).
+ */
+function instanceHosts(prefix: string, count: number): string[] {
+  const p = prefix.trim();
+  if (!p) return [];
+  if (/[.:]/.test(p)) return [p];
+  const n = Math.max(1, Math.min(MAX_INSTANCES, Math.floor(count) || 1));
+  return Array.from({ length: n }, (_, i) => `${p}-${i}${INSTANCE_DOMAIN}`);
+}
+
+/** One sticky failure command, relayed to the instance by this dashboard's server. */
+async function stickyCall(host: string, method: 'GET' | 'POST' | 'DELETE', body?: Record<string, string | number>) {
+  const res = await fetch(`/api/sticky-failure?${new URLSearchParams({ instance: host })}`, {
+    method,
+    cache: 'no-store',
+    ...(body && { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }),
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok) {
+    throw new Error(
+      data?.error ??
+      (res.status === 401 ? 'The instance refused the login (a different DASHBOARD_AUTH?)'
+        : res.status === 404 ? 'No sticky failure there (no DASHBOARD_AUTH, ORIGIN_ONLY, or an older image)'
+        : `HTTP ${res.status}`),
+    );
+  }
+  return data as { instanceId: string; sticky: StickyInfo | null };
+}
+
+function describeSticky(s: StickyInfo): string {
+  const how =
+    s.failMode === 'error' ? `answers ${s.failStatus}`
+    : s.failMode === 'delay' ? `answers after ${(s.delayMs ?? 0) / 1000}s`
+    : s.failMode === 'jitter' ? `answers after ${(s.jitterMin ?? 0) / 1000}–${(s.jitterMax ?? 0) / 1000}s`
+    : 'hangs';
+  return s.failPercent < 100 ? `${how} on ${s.failPercent}% of requests` : how;
+}
+
+function formatRemaining(s: number): string {
+  const t = Math.max(0, Math.round(s));
+  const h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), sec = t % 60;
+  return h ? `${h}h ${m}m` : `${m}:${String(sec).padStart(2, '0')}`;
+}
+
+function StickyTab() {
+  const [prefix, setPrefix] = useState('');
+  const [count, setCount] = useState(3);
+  const [mode, setMode] = useState<HealthMode>('error');
+  const [failStatus, setFailStatus] = useState(503);
+  const [delayS, setDelayS] = useState(5);
+  const [jitterMinS, setJitterMinS] = useState(0.1);
+  const [jitterMaxS, setJitterMaxS] = useState(2);
+  const [failPercent, setFailPercent] = useState(100);
+  const [ttlMin, setTtlMin] = useState(30);
+  const [rows, setRows] = useState<Record<string, StickyRow>>({});
+  const [now, setNow] = useState(() => Date.now());
+  const hosts = useMemo(() => instanceHosts(prefix, count), [prefix, count]);
+
+  // Counts the time left down between checks. Paused while the tab is hidden.
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+
+  function modeBody(): Record<string, string | number> {
+    const body: Record<string, string | number> = { failMode: mode, failPercent, ttlS: Math.round(ttlMin * 60) };
+    if (mode === 'error') body.failStatus = failStatus;
+    if (mode === 'delay') body.delayMs = Math.round(delayS * 1000);
+    if (mode === 'jitter') {
+      body.jitterMin = Math.round(jitterMinS * 1000);
+      body.jitterMax = Math.round(jitterMaxS * 1000);
+    }
+    return body;
+  }
+
+  async function act(host: string, method: 'GET' | 'POST' | 'DELETE') {
+    setRows((r) => ({ ...r, [host]: { ...r[host], loading: true, error: undefined } }));
+    try {
+      const data = await stickyCall(host, method, method === 'POST' ? modeBody() : undefined);
+      setRows((r) => ({ ...r, [host]: { loading: false, instanceId: data.instanceId, sticky: data.sticky, checkedAt: Date.now() } }));
+    } catch (e) {
+      setRows((r) => ({ ...r, [host]: { ...r[host], loading: false, error: e instanceof Error ? e.message : String(e) } }));
+    }
+  }
+
+  return (
+    <div className="grid items-start gap-4 md:grid-cols-[340px_1fr]">
+      <Card>
+        <CardHeader><CardTitle className="text-sm">Sticky failure</CardTitle></CardHeader>
+        <CardContent className="space-y-4">
+          <p className="text-muted-foreground text-xs">
+            Puts one instance in a failure mode that applies to <span className="text-foreground font-medium">every</span> request it gets, including a proxy&rsquo;s health checks and traffic you don&rsquo;t send, until you reset it or it expires. Commands go to each instance directly by its internal name, never through a proxy, which would pass them to whichever instance it picks.
+          </p>
+          <p className="text-muted-foreground text-xs">
+            For a test where only your own requests should fail, use the per-request flags (the Health checks and Timeouts tabs) instead: nothing is left behind if the run stops.
+          </p>
+
+          <div className="grid grid-cols-[1fr_80px] gap-3">
+            <div className="space-y-1.5">
+              <Label htmlFor="st-prefix">Workload-network-location</Label>
+              <Input id="st-prefix" value={prefix} onChange={(e) => setPrefix(e.target.value)} placeholder="alb-lb-tester-default-us-east-1" />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="st-count">Instances</Label>
+              <Input id="st-count" type="number" min={1} max={MAX_INSTANCES} value={count} onChange={(e) => setCount(+e.target.value)} />
+            </div>
+          </div>
+          <p className="text-muted-foreground text-[11px]">
+            Instances are <span className="font-mono">&lt;this&gt;-0{INSTANCE_DOMAIN}</span>, <span className="font-mono">-1</span>, &hellip; on port 3000, and must share this dashboard&rsquo;s login. Or enter one full host[:port].
+          </p>
+          <Button block theme="outline" disabled={!hosts.length} onClick={() => hosts.forEach((h) => act(h, 'GET'))}>Check all</Button>
+
+          <div className="space-y-1.5">
+            <Label>How it fails</Label>
+            <Select value={mode} onValueChange={(v) => setMode(v as HealthMode)}>
+              <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                {HEALTH_MODES.map((m) => <SelectItem key={m.value} value={m.value}>{m.label}</SelectItem>)}
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            {mode === 'error' && (
+              <div className="space-y-1.5">
+                <Label>Status</Label>
+                <Select value={String(failStatus)} onValueChange={(v) => setFailStatus(+v)}>
+                  <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    {FAIL_STATUSES.map((code) => <SelectItem key={code} value={String(code)}>{code}</SelectItem>)}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
+            {mode === 'delay' && (
+              <div className="space-y-1.5">
+                <Label htmlFor="st-delay">Delay s</Label>
+                <Input id="st-delay" type="number" min={0} max={60} step={0.5} value={delayS} onChange={(e) => setDelayS(+e.target.value)} />
+              </div>
+            )}
+            {mode === 'jitter' && (
+              <div className="space-y-1.5">
+                <Label htmlFor="st-jmin">Delay range s</Label>
+                <div className="flex items-center gap-1.5">
+                  <Input id="st-jmin" aria-label="Shortest delay s" type="number" min={0} max={60} step={0.1} value={jitterMinS} onChange={(e) => setJitterMinS(+e.target.value)} />
+                  <span className="text-muted-foreground text-xs">–</span>
+                  <Input aria-label="Longest delay s" type="number" min={0} max={60} step={0.1} value={jitterMaxS} onChange={(e) => setJitterMaxS(+e.target.value)} />
+                </div>
+              </div>
+            )}
+            {mode === 'hang' && <div />}
+            <div className="space-y-1.5">
+              <Label htmlFor="st-pct">Fail % of requests</Label>
+              <Input id="st-pct" type="number" min={1} max={100} value={failPercent} onChange={(e) => setFailPercent(+e.target.value)} />
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <Label htmlFor="st-ttl">Reset itself after (minutes)</Label>
+            <Input id="st-ttl" type="number" min={1} max={1440} value={ttlMin} onChange={(e) => setTtlMin(+e.target.value)} />
+          </div>
+          <p className="text-muted-foreground text-xs">
+            A safety net, so a forgotten instance recovers on its own: 30 minutes by default, 24 hours at most. A restart also resets it.
+          </p>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader><CardTitle className="text-sm">Instances</CardTitle></CardHeader>
+        <CardContent>
+          {hosts.length === 0 ? (
+            <div className="text-muted-foreground py-12 text-center text-sm">
+              Enter the workload&rsquo;s <span className="font-mono">&lt;workload&gt;-&lt;network&gt;-&lt;location&gt;</span> to list its instances.
+            </div>
+          ) : (
+            <table className="w-full text-xs">
+              <thead className="text-muted-foreground text-left text-[10.5px]">
+                <tr><Th>Instance</Th><Th>State</Th></tr>
+              </thead>
+              <tbody>
+                {hosts.map((host) => {
+                  const row = rows[host];
+                  const left = row?.sticky && row.checkedAt ? row.sticky.remainingS - (now - row.checkedAt) / 1000 : 0;
+                  return (
+                    <tr key={host}>
+                      <Td className="w-1/2 align-top">
+                        <div className="font-mono break-all">{host}</div>
+                        {row?.instanceId && <div className="text-muted-foreground font-mono text-[11px]">id {row.instanceId}</div>}
+                      </Td>
+                      <Td className="align-top">
+                        {row?.error ? <span className="text-destructive">{row.error}</span>
+                          : !row?.checkedAt ? <span className="text-muted-foreground">Not checked</span>
+                          : row.sticky && left > 0 ? (
+                            <span>
+                              <Badge type="danger">Broken</Badge>{' '}
+                              {describeSticky(row.sticky)}
+                              <span className="text-muted-foreground"> · resets in {formatRemaining(left)}</span>
+                            </span>
+                          ) : <Badge type="success">Normal</Badge>}
+                        <div className="mt-1.5 flex gap-1.5">
+                          <Button size="small" theme="outline" loading={row?.loading} onClick={() => act(host, 'GET')}>Check</Button>
+                          <Button size="small" type="danger" disabled={row?.loading} onClick={() => act(host, 'POST')}>Break</Button>
+                          <Button size="small" theme="outline" disabled={row?.loading} onClick={() => act(host, 'DELETE')}>Reset</Button>
+                        </div>
+                      </Td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
           )}
         </CardContent>
       </Card>

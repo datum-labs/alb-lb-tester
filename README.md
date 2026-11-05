@@ -8,7 +8,7 @@ A tiny site for exercising two Datum HTTPProxy features against real backends:
 
 It has two halves:
 
-1. **Origin echo** at `GET /api/whoami` — returns JSON naming which backend served the request (`backendId`), plus the client IP, Host header, and the `x-lb-key` header. This is what your HTTPProxy backends point at. Deploy it two or three times so you have distinct origins. Add `?fail=<backendId>` (comma-separated, or `*`) and the named backend misbehaves instead: by default it answers `?failStatus` (default 503), and it can also answer slowly, hang, or fail only some requests (see [Failure injection](#failure-injection)). Every other backend ignores it.
+1. **Origin echo** at `GET /api/whoami` — returns JSON naming which backend served the request (`backendId`), plus the client IP, Host header, and the `x-lb-key` header. This is what your HTTPProxy backends point at. Deploy it two or three times so you have distinct origins. Add `?fail=<backendId>` (comma-separated, or `*`) and the named backend misbehaves instead: by default it answers `?failStatus` (default 503), and it can also answer slowly, hang, or fail only some requests (see [Failure injection](#failure-injection)). Every other backend ignores it. Behind a login, one instance can also be left broken for every request until it's reset (see [Sticky failure](#sticky-failure)).
 2. **Dashboard** at `/` — fires a burst of requests through your proxy URL and charts which backend served each one, so you can see weights and algorithms at work.
 
 ## Deploy the backends to Vercel
@@ -64,7 +64,7 @@ Open the dashboard, enter your **proxy hostname** (e.g. `https://your-alb.datump
 
 ## Features
 
-The dashboard has five tabs, all driven by the shared proxy URL at the top.
+The dashboard has five tabs, all driven by the shared proxy URL at the top, plus a sixth, **Sticky failure**, behind a login (see [Sticky failure](#sticky-failure)).
 
 **Load balancing** — fire a burst (or a continuous **Live** stream with a rolling req/s meter) and see:
 - Distribution bars per backend, with **expected-vs-observed** deltas when you enter the weights you configured
@@ -134,6 +134,37 @@ curl "https://<proxy>/api/whoami?fail=backend-b&failMode=delay&delayMs=3000"
 curl "https://<proxy>/api/whoami?fail=ab12cd&failMode=hang&failPercent=30"
 ```
 
+## Sticky failure
+
+`?fail=` only affects the requests that carry it. Sometimes an origin has to stay broken for **every** request, including ones the tester doesn't send: a proxy's active health checks, real clients, another team's test. Sticky failure puts one instance in any of the failure modes above until it's reset, or until it resets itself.
+
+It only exists behind a login (`DASHBOARD_AUTH`, see [Run on Datum Compute](#run-on-datum-compute)). Without one, or with `ORIGIN_ONLY=1`, `/api/sticky-failure` returns 404 and no instance can be left broken, so a deployment that automated tests use without a login keeps its guarantee: every failure was asked for by the request that got it, and a run that's killed halfway leaves nothing behind.
+
+| Request | Effect |
+| --- | --- |
+| `GET /api/sticky-failure` | Current state: `sticky` is `null`, or the mode with its parameters, `setAt`, `expiresAt` and `remainingS` |
+| `POST /api/sticky-failure` | Set a mode. JSON body with the `?fail=` parameters (`failMode`, `failStatus`, `delayMs`, `jitterMin`, `jitterMax`, `failPercent`) and `ttlS` |
+| `DELETE /api/sticky-failure` | Reset |
+
+While a mode is set, the instance applies it to every request to `/api/whoami`, whether it came directly or through a proxy. A request whose `?fail=` names this instance or its backend still gets what the flags ask for instead. Failed responses carry `"sticky": true` in the body.
+
+- **It resets itself** after `ttlS` seconds: 30 minutes by default, 24 hours at most, so a forgotten instance recovers on its own. A restart also resets it; the state is kept in memory only.
+- **Reach the instance directly.** A command sent through a proxy lands on whichever instance the proxy picks. On Datum Compute, use the instance's internal name, `<workload>-<network>-<location>-<n>.instances.datum.internal:3000`, from inside the network, or the dashboard.
+- It needs the login, takes changes only by `POST` and `DELETE`, sends no CORS headers, and refuses cross-site browser requests, so another site can't use a saved login to break an instance.
+- An unknown `failMode` is refused (`?fail=` reads it as `error`), since a typo would last for the whole TTL.
+
+```bash
+# from inside the network: instance 1 answers 503 for 10 minutes
+curl -u user:password -X POST -H 'Content-Type: application/json'   -d '{"failMode":"error","failStatus":503,"ttlS":600}'   http://alb-lb-tester-default-us-east-1-1.instances.datum.internal:3000/api/sticky-failure
+
+curl -u user:password http://alb-lb-tester-default-us-east-1-1.instances.datum.internal:3000/api/sticky-failure
+curl -u user:password -X DELETE http://alb-lb-tester-default-us-east-1-1.instances.datum.internal:3000/api/sticky-failure
+```
+
+The **Sticky failure** tab drives this from the dashboard. Enter the workload's `<workload>-<network>-<location>` and its instance count, and each instance gets **Check**, **Break** (with the mode, parameters and TTL from the form) and **Reset**. The dashboard's server sends the commands to each instance by internal name, with your login, so every instance of the workload must have the same `DASHBOARD_AUTH`. Only `*.datum.internal` names are accepted (any host under `next dev` or `ALLOW_PRIVATE_TARGETS=1`, for testing locally, for example `localhost:3001`).
+
+**Which to use:** per-request flags when only your own test traffic should fail. They work through the proxy, need no login, and leave nothing behind. Sticky failure when the origin has to look broken to everyone, for example to watch active health checks eject it, or to see what real clients get.
+
 ## Headers
 
 `/api/whoami` echoes the request headers it received in `headers` (`headersRaw: true` when they're exactly as they arrived), and lists the response headers it sent in `sentHeaders`. Ask it to send more with an `X-LBT-Resp-Header: Name: Value` request header, or numbered `X-LBT-Resp-Header-1`, `-2`, ... for several (a client may join repeats of one header name with commas, and a `Set-Cookie` value can contain commas). One with the same name as the origin's own header replaces it. Up to 20 headers of up to 1024 characters each. Framing and connection headers (`Content-Length`, `Content-Type`, `Transfer-Encoding`, `Connection`, ...) are refused and listed in `rejectedRespHeaders`. The `X-LBT-Resp-Header` headers are left out of the `headers` echo.
@@ -165,9 +196,9 @@ datumctl compute deploy alb-lb-tester --image ghcr.io/datum-labs/alb-lb-tester:l
   --location us-central-1 --min 3 --http-port 3000 --env BACKEND_ID=compute
 ```
 
-The server binds `::` because Compute instances only have IPv6 addresses; an image built before that fix needs `--env HOSTNAME=::`. Each instance picks its own id at start; set `INSTANCE_ID` to name them yourself. A deployment that only needs to be an origin, such as one behind a proxy that automated tests use, can set `ORIGIN_ONLY=1`: `/api/whoami` keeps answering, and the dashboard, `/api/inspect` and `/api/probe` return 404, so it doesn't expose public server-side fetch tools nobody there uses. The repository and its package are public, so the workload needs no image pull secret. A project without a network named `default` needs `--network <name> --yes`, which creates one.
+The server binds `::` because Compute instances only have IPv6 addresses; an image built before that fix needs `--env HOSTNAME=::`. Each instance picks its own id at start; set `INSTANCE_ID` to name them yourself. A deployment that only needs to be an origin, such as one behind a proxy that automated tests use, can set `ORIGIN_ONLY=1`: `/api/whoami` keeps answering, and the dashboard, `/api/inspect`, `/api/probe` and `/api/sticky-failure` return 404, so it doesn't expose public server-side fetch tools nobody there uses. The repository and its package are public, so the workload needs no image pull secret. A project without a network named `default` needs `--network <name> --yes`, which creates one.
 
-To put the dashboard behind a login, set `DASHBOARD_AUTH=user:password`. The dashboard, `/api/inspect` and `/api/probe` then need HTTP basic auth, and the inspector and probe may also reach `*.datum.internal` names, so a test can hit one instance directly. `/api/whoami` stays open, since proxies, health checks and automated tests call it. The tools only take requests from the dashboard's own pages or from clients like curl, so another site can't use your saved login.
+To put the dashboard behind a login, set `DASHBOARD_AUTH=user:password`. The dashboard, `/api/inspect` and `/api/probe` then need HTTP basic auth, and the inspector and probe may also reach `*.datum.internal` names, so a test can hit one instance directly. The login also turns on [sticky failure](#sticky-failure). `/api/whoami` stays open, since proxies, health checks and automated tests call it. The tools only take requests from the dashboard's own pages or from clients like curl, so another site can't use your saved login.
 
 ### Regular container image
 
