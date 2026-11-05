@@ -1,5 +1,6 @@
 import ipaddr from 'ipaddr.js';
 import { Agent, buildConnector, fetch } from 'undici';
+import { INTERNAL_SUFFIX, internalTargetsAllowed } from './dashboard-auth';
 
 // Fetch for URLs a caller supplies (the inspector and the probe). The
 // dashboard is public and unauthenticated, so without this anyone could use
@@ -8,7 +9,9 @@ import { Agent, buildConnector, fetch } from 'undici';
 //
 // The check runs on the address each connection actually reaches, after DNS,
 // so it covers IP literals, DNS answers that change between lookups, and every
-// redirect hop alike. Only http(s) to public unicast addresses is allowed.
+// redirect hop alike. Only http(s) to public unicast addresses is allowed,
+// plus, behind DASHBOARD_AUTH, private addresses reached by a *.datum.internal
+// name (this network's instances).
 //
 // `next dev`, or ALLOW_PRIVATE_TARGETS=1, lifts the address check, for testing
 // an origin running on your own machine.
@@ -33,6 +36,20 @@ export function isPublicAddress(address: string): boolean {
   }
 }
 
+/**
+ * True for a private address reached by an internal name, when internal
+ * targets are allowed. Loopback, link-local and the like never are.
+ */
+function isInternalTarget(hostname: string, address: string): boolean {
+  if (!internalTargetsAllowed || !hostname.toLowerCase().endsWith(INTERNAL_SUFFIX)) return false;
+  try {
+    const range = ipaddr.process(address).range();
+    return range === 'uniqueLocal' || range === 'private';
+  } catch {
+    return false;
+  }
+}
+
 const connect = buildConnector({});
 
 const agent = new Agent({
@@ -40,7 +57,8 @@ const agent = new Agent({
     connect(opts, (err, socket) => {
       if (err) return callback(err, null);
       const address = socket.remoteAddress;
-      if (!allowPrivate && (!address || !isPublicAddress(address))) {
+      const allowed = allowPrivate || (address && (isPublicAddress(address) || isInternalTarget(opts.hostname, address)));
+      if (!allowed) {
         socket.destroy();
         return callback(new Error(`${opts.hostname} is not a public address (${address ?? 'unknown'}), refused`), null);
       }
