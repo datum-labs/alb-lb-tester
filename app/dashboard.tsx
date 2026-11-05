@@ -519,12 +519,12 @@ function InspectTab({ base, target, item, container }: { base: string; target: (
     if (!base) { setErr('Enter the proxy base URL above first.'); return; }
     setLoading(true); setErr(null); setData(null); setCopied(false);
     try {
-      // Response headers are asked of the origin in its own URL; request
-      // headers are sent by the inspector.
+      // The inspector sends the request headers, plus numbered
+      // X-LBT-Resp-Header ones asking the origin for the response headers.
       const u = new URL(target());
-      for (const l of nonEmpty(respText)) u.searchParams.append('respHeader', l.replace(/:\s*/, ':'));
       const q = new URLSearchParams({ url: u.toString() });
       for (const l of nonEmpty(reqText)) q.append('h', l);
+      nonEmpty(respText).forEach((l, i) => q.append('h', `X-LBT-Resp-Header-${i + 1}: ${l}`));
       const res = await fetch(`/api/inspect?${q}`, { cache: 'no-store' });
       setData(await res.json());
       setRanAt(new Date());

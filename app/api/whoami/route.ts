@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { foldHeaders, parseHeaderLines } from '../../header-diff';
+import { foldHeaders, parseHeaderLines, RESP_HEADER } from '../../header-diff';
 
 // Always run per-request; never cache. Load balancing is only observable if
 // every request actually reaches an origin.
@@ -101,15 +101,35 @@ function wait(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+/** The response headers asked for, in order. */
+function askedRespHeaders(pairs: [string, string][]): string[] {
+  return pairs
+    .map(([k, v], i) => {
+      const m = RESP_HEADER.exec(k.toLowerCase());
+      return m && { n: m[1] === undefined ? 0 : Number(m[1]), i, v };
+    })
+    .filter((x) => x !== null)
+    .sort((a, b) => a.n - b.n || a.i - b.i)
+    .map((x) => x.v);
+}
+
 /**
- * Response headers asked for with `?respHeader=Name:Value` (repeatable), so a
+ * Response headers asked for with X-LBT-Resp-Header request headers, so a
  * test can see what the edge does to headers an origin sends: Server,
  * Set-Cookie, Cache-Control, CORS and so on. They replace this origin's own
  * header of the same name. Framing and connection headers are refused, and
  * the count and length are capped.
+ *
+ * They're asked for in request headers, not the URL, so that a link, a
+ * redirect or a cross-site form can't make this origin set cookies or
+ * redirect in a visitor's browser: none of those can add request headers.
+ * The old `?respHeader=` is refused for that reason.
  */
-function responseHeaders(url: URL, own: Record<string, string>) {
-  const { headers: custom, rejected } = parseHeaderLines(url.searchParams.getAll('respHeader'));
+function responseHeaders(url: URL, asked: string[], own: Record<string, string>) {
+  const { headers: custom, rejected } = parseHeaderLines(asked);
+  for (const line of url.searchParams.getAll('respHeader')) {
+    rejected.push({ line, reason: 'respHeader= is no longer read; send X-LBT-Resp-Header request headers instead' });
+  }
   const replaced = new Set(custom.map(([k]) => k));
   const pairs: [string, string][] = [
     ['content-type', 'application/json'],
@@ -124,8 +144,8 @@ function responseHeaders(url: URL, own: Record<string, string>) {
   return { headers, sent: foldHeaders(pairs), rejected };
 }
 
-function json(body: Record<string, unknown>, status: number, url: URL, own: Record<string, string>) {
-  const { headers, sent, rejected } = responseHeaders(url, own);
+function json(body: Record<string, unknown>, status: number, url: URL, asked: string[], own: Record<string, string>) {
+  const { headers, sent, rejected } = responseHeaders(url, asked, own);
   const full = {
     ...body,
     sentHeaders: sent,
@@ -137,6 +157,9 @@ function json(body: Record<string, unknown>, status: number, url: URL, own: Reco
   return new NextResponse(JSON.stringify(full), { status, headers });
 }
 
+// A CORS preflight. It must never set the asked-for response headers, and
+// never pair a reflected Origin with Access-Control-Allow-Credentials: that's
+// what keeps a cross-site page from using X-LBT-Resp-Header to set cookies.
 export async function OPTIONS() {
   return new NextResponse(null, { status: 204, headers: corsHeaders });
 }
@@ -147,24 +170,26 @@ export async function OPTIONS() {
  * what Next passes on, which may include X-Forwarded-* headers Next filled in
  * itself.
  */
-function receivedHeaders(req: NextRequest): { headers: Record<string, string>; raw: boolean } {
+function receivedHeaders(req: NextRequest): { pairs: [string, string][]; raw: boolean } {
   const stamped = req.headers.get('x-lbt-received');
   if (stamped) {
     try {
       const pairs = JSON.parse(Buffer.from(stamped, 'base64').toString('utf8')) as [string, string][];
-      return { headers: foldHeaders(pairs), raw: true };
+      return { pairs, raw: true };
     } catch {
       /* fall through */
     }
   }
-  const headers = Object.fromEntries(req.headers.entries());
-  delete headers['x-lbt-received'];
-  return { headers, raw: false };
+  return { pairs: [...req.headers.entries()].filter(([k]) => k !== 'x-lbt-received'), raw: false };
 }
 
 async function handle(req: NextRequest) {
   requestCount += 1;
-  const { headers, raw } = receivedHeaders(req);
+  const { pairs, raw } = receivedHeaders(req);
+  const asked = askedRespHeaders(pairs);
+  // The echo leaves out the headers that asked for response headers: they're
+  // instructions to this origin, not something the edge did.
+  const headers = foldHeaders(pairs.filter(([k]) => !RESP_HEADER.test(k.toLowerCase())));
   const id = backendId();
   const url = new URL(req.url);
   const failure = failureFor(url, id);
@@ -173,7 +198,7 @@ async function handle(req: NextRequest) {
   if (failure?.mode === 'error') {
     return json(
       { backendId: id, instanceId, failed: true, failMode: 'error', status: failure.status, servedAt: new Date().toISOString() },
-      failure.status, url, { ...idHeaders, 'x-fail-mode': 'error' },
+      failure.status, url, asked, { ...idHeaders, 'x-fail-mode': 'error' },
     );
   }
 
@@ -184,7 +209,7 @@ async function handle(req: NextRequest) {
     await wait(MAX_HANG_MS, req.signal);
     return json(
       { backendId: id, instanceId, failed: true, failMode: 'hang', servedAt: new Date().toISOString() },
-      504, url, { ...idHeaders, 'x-fail-mode': 'hang' },
+      504, url, asked, { ...idHeaders, 'x-fail-mode': 'hang' },
     );
   }
 
@@ -213,7 +238,7 @@ async function handle(req: NextRequest) {
     headersRaw: raw,
   };
 
-  return json(body, 200, url, failure ? { ...idHeaders, 'x-fail-mode': failure.mode } : idHeaders);
+  return json(body, 200, url, asked, failure ? { ...idHeaders, 'x-fail-mode': failure.mode } : idHeaders);
 }
 
 export async function GET(req: NextRequest) {

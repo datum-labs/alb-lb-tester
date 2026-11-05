@@ -49,6 +49,12 @@ export const UNSETTABLE_HEADERS = new Set([
   'content-type',
 ]);
 
+// Request headers that ask the origin (whoami) for response headers: one
+// `X-LBT-Resp-Header: Name: Value`, or numbered -1, -2, ... for several.
+// Numbered because a client may join repeats of one name with commas, and a
+// Set-Cookie value can itself contain commas.
+export const RESP_HEADER = /^x-lbt-resp-header(?:-(\d+))?$/;
+
 // RFC 9110 token characters.
 const TOKEN = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 
@@ -97,9 +103,9 @@ export function foldHeaders(pairs: Iterable<[string, string]>): Record<string, s
 }
 
 /** Same as foldHeaders, for a fetch Headers object (keeps Set-Cookie apart). */
-export function headersObject(h: Headers): Record<string, string> {
+export function headersObject(h: Iterable<[string, string]> & { getSetCookie(): string[] }): Record<string, string> {
   const pairs: [string, string][] = [];
-  h.forEach((v, k) => { if (k !== 'set-cookie') pairs.push([k, v]); });
+  for (const [k, v] of h) if (k !== 'set-cookie') pairs.push([k, v]);
   for (const c of h.getSetCookie()) pairs.push(['set-cookie', c]);
   return foldHeaders(pairs);
 }

@@ -83,6 +83,7 @@ Things to know:
 - The inspector runs on the dashboard's server, so "client address" is that server's address, not your browser's. To check from your own machine, use curl (see [Headers](#headers)).
 - Origin headers need the target to be this tester's `/api/whoami`. The request comparison needs the origin to report headers as they arrived: the Datum Compute image does (`raw-headers.cjs` records them before Next fills in missing `X-Forwarded-*`); other deployments are flagged, because a forwarding header shown as added may come from Next, not the edge.
 - HTTP/2 lowercases header names and fetch doesn't keep their order, so case and order can't be checked.
+- The inspector, and the server-side probe the health checks use, only fetch `http` and `https` URLs on public addresses. Loopback, private, link-local and similar addresses are refused, after DNS and on every redirect, so the public dashboard can't be used to reach the network it runs in. `next dev` lifts this, as does `ALLOW_PRIVATE_TARGETS=1`, for testing an origin on your own machine.
 
 **WAF probes** — sends a set of XSS, SQLi, command-injection and traversal payloads plus benign requests, and reports the block rate, any false positives, and a per-payload table.
 
@@ -135,14 +136,16 @@ curl "https://<proxy>/api/whoami?fail=ab12cd&failMode=hang&failPercent=30"
 
 ## Headers
 
-`/api/whoami` echoes the request headers it received in `headers` (`headersRaw: true` when they're exactly as they arrived), and lists the response headers it sent in `sentHeaders`. Ask it to send more with `respHeader=Name:Value`, repeated for several; one with the same name as the origin's own header replaces it. Up to 20 headers of up to 1024 characters each. Framing and connection headers (`Content-Length`, `Content-Type`, `Transfer-Encoding`, `Connection`, ...) are refused and listed in `rejectedRespHeaders`.
+`/api/whoami` echoes the request headers it received in `headers` (`headersRaw: true` when they're exactly as they arrived), and lists the response headers it sent in `sentHeaders`. Ask it to send more with an `X-LBT-Resp-Header: Name: Value` request header, or numbered `X-LBT-Resp-Header-1`, `-2`, ... for several (a client may join repeats of one header name with commas, and a `Set-Cookie` value can contain commas). One with the same name as the origin's own header replaces it. Up to 20 headers of up to 1024 characters each. Framing and connection headers (`Content-Length`, `Content-Type`, `Transfer-Encoding`, `Connection`, ...) are refused and listed in `rejectedRespHeaders`. The `X-LBT-Resp-Header` headers are left out of the `headers` echo.
+
+They're asked for in request headers, not the URL, so a link, redirect or cross-site form can't make the origin set cookies or redirect in someone's browser. The old `respHeader=` query parameter is refused.
 
 ```bash
 # what does the edge do to a client's X-Forwarded-For?
 curl -s -H "X-Forwarded-For: 203.0.113.7" "https://<proxy>/api/whoami" | jq .headers
 
 # do both cookies and the Server header reach the client?
-curl -s -D - -o /dev/null "https://<proxy>/api/whoami?respHeader=Server:my-app&respHeader=Set-Cookie:a=1&respHeader=Set-Cookie:b=2"
+curl -s -D - -o /dev/null "https://<proxy>/api/whoami"   -H "X-LBT-Resp-Header-1: Server: my-app"   -H "X-LBT-Resp-Header-2: Set-Cookie: a=1"   -H "X-LBT-Resp-Header-3: Set-Cookie: b=2"
 ```
 
 ## Run on Datum Compute
