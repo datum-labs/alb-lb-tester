@@ -16,7 +16,7 @@ import { INTERNAL_SUFFIX, internalTargetsAllowed } from './dashboard-auth';
 // `next dev`, or ALLOW_PRIVATE_TARGETS=1, lifts the address check, for testing
 // an origin running on your own machine.
 
-const allowPrivate = process.env.NODE_ENV === 'development' || process.env.ALLOW_PRIVATE_TARGETS === '1';
+export const allowPrivate = process.env.NODE_ENV === 'development' || process.env.ALLOW_PRIVATE_TARGETS === '1';
 
 /**
  * True for public unicast addresses. IPv4-mapped IPv6 is checked as IPv4, and
