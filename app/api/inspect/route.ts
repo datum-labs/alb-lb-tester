@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { originOnly } from '../../origin-only';
 
 // Server-side inspector: fetches the target from the serverless runtime, so it
 // can read response headers (HSTS, x-envoy-*) and redirects that the browser's
@@ -27,6 +28,7 @@ async function timedFetch(url: string, init: RequestInit) {
 }
 
 export async function GET(req: NextRequest) {
+  if (originOnly) return new NextResponse(null, { status: 404 });
   const target = req.nextUrl.searchParams.get('url');
   if (!target) {
     return NextResponse.json({ error: 'Missing url parameter' }, { status: 400 });

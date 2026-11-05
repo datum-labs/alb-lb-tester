@@ -143,7 +143,7 @@ datumctl compute deploy alb-lb-tester --image ghcr.io/datum-labs/alb-lb-tester:l
   --location us-central-1 --min 3 --http-port 3000 --env BACKEND_ID=compute
 ```
 
-The server binds `::` because Compute instances only have IPv6 addresses; an image built before that fix needs `--env HOSTNAME=::`. Each instance picks its own id at start; set `INSTANCE_ID` to name them yourself. The repository and its package are public, so the workload needs no image pull secret. A project without a network named `default` needs `--network <name> --yes`, which creates one.
+The server binds `::` because Compute instances only have IPv6 addresses; an image built before that fix needs `--env HOSTNAME=::`. Each instance picks its own id at start; set `INSTANCE_ID` to name them yourself. A deployment that only needs to be an origin, such as one behind a proxy that automated tests use, can set `ORIGIN_ONLY=1`: `/api/whoami` keeps answering, and the dashboard, `/api/inspect` and `/api/probe` return 404, so it doesn't expose public server-side fetch tools nobody there uses. The repository and its package are public, so the workload needs no image pull secret. A project without a network named `default` needs `--network <name> --yes`, which creates one.
 
 ### Regular container image
 
