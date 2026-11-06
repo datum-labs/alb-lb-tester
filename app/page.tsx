@@ -1,3 +1,4 @@
+import Link from 'next/link';
 import { notFound } from 'next/navigation';
 import { Dashboard } from './dashboard';
 import { stickyAllowed } from './instance';
@@ -40,16 +41,21 @@ export default function Page() {
             Fire traffic through a Datum HTTPProxy and watch which backend serves each request. Tests weighted backends and load-balancing algorithms.
           </p>
         </div>
-        <div
-          className="bg-card flex shrink-0 items-center gap-2 rounded-full border py-1.5 pl-2.5 pr-3.5 text-xs"
-          title="The BACKEND_ID this deployment was given. It is the origin the dashboard runs on, not necessarily the one your proxy routes to."
-        >
-          <span className="relative flex size-2.5 items-center justify-center">
-            <span className="absolute size-2.5 rounded-full opacity-30" style={{ background: color }} />
-            <span className="size-1.5 rounded-full" style={{ background: color }} />
-          </span>
-          <span className="text-muted-foreground">serving this page</span>
-          <span className="font-mono font-medium">{id}</span>
+        <div className="flex shrink-0 flex-wrap items-center gap-2">
+          <Link href="/setup" className="bg-card hover:bg-muted rounded-full border px-3.5 py-1.5 text-xs font-medium transition-colors">
+            Setup
+          </Link>
+          <div
+            className="bg-card flex shrink-0 items-center gap-2 rounded-full border py-1.5 pl-2.5 pr-3.5 text-xs"
+            title="The BACKEND_ID this deployment was given. It is the origin the dashboard runs on, not necessarily the one your proxy routes to."
+          >
+            <span className="relative flex size-2.5 items-center justify-center">
+              <span className="absolute size-2.5 rounded-full opacity-30" style={{ background: color }} />
+              <span className="size-1.5 rounded-full" style={{ background: color }} />
+            </span>
+            <span className="text-muted-foreground">serving this page</span>
+            <span className="font-mono font-medium">{id}</span>
+          </div>
         </div>
       </header>
 
