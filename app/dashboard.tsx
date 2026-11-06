@@ -985,10 +985,12 @@ function WafTab({ base, path, via, item, container }: { base: string; path: stri
   const [rows, setRows] = useState<WafRow[]>([]);
   const [note, setNote] = useState<string | null>(null);
   const [ranVia, setRanVia] = useState<Via>('server');
+  // The browser-mode control request's answer, shown when it wasn't a readable 200.
+  const [control, setControl] = useState<{ status: number; error?: string } | null>(null);
 
   async function run() {
     if (!base) { setNote('Enter the proxy base URL above first.'); return; }
-    setRunning(true); setNote(null); setRows([]); setRanVia(via);
+    setRunning(true); setNote(null); setRows([]); setRanVia(via); setControl(null);
     const out: WafRow[] = [];
     // From the browser, another origin's block page has no CORS headers, so
     // its status can't be read. When the attacks go to /api/whoami, which
@@ -1005,6 +1007,7 @@ function WafTab({ base, path, via, item, container }: { base: string; path: stri
       const control = await browserFetch(`${base}/api/whoami`);
       await control.res?.body?.cancel();
       proxyServing = control.status === 200;
+      setControl({ status: control.status, error: control.error });
     }
     for (const j of jobs) {
       let status = 0;
@@ -1031,15 +1034,19 @@ function WafTab({ base, path, via, item, container }: { base: string; path: stri
   }
 
   const sum = useMemo(() => {
+    // An attack with no answer, or one that couldn't be read and wasn't
+    // counted as blocked, is unknown, and left out of the block rate rather
+    // than read as passed.
     const atk = rows.filter((r) => r.kind === 'attack');
+    const judged = atk.filter((r) => r.blocked || (!r.unreadable && r.status !== 0));
     const ben = rows.filter((r) => r.kind === 'benign');
     return {
-      atkTotal: atk.length, atkBlocked: atk.filter((r) => r.blocked).length,
+      atkTotal: judged.length, atkBlocked: judged.filter((r) => r.blocked).length, atkUnknown: atk.length - judged.length,
       benTotal: ben.length, benBlocked: ben.filter((r) => r.blocked).length,
       unreadable: rows.filter((r) => r.unreadable).length,
     };
   }, [rows]);
-  const blockRate = sum.atkTotal ? (sum.atkBlocked / sum.atkTotal) * 100 : 0;
+  const blockRate = sum.atkTotal ? (sum.atkBlocked / sum.atkTotal) * 100 : null;
 
   return (
     <div className="grid items-start gap-4 md:grid-cols-[340px_1fr]">
@@ -1067,9 +1074,19 @@ function WafTab({ base, path, via, item, container }: { base: string; path: stri
                   Measured from your browser{sum.unreadable ? `; ${sum.unreadable} ${sum.unreadable === 1 ? 'answer' : 'answers'} had no CORS headers, so ${sum.unreadable === 1 ? 'its' : 'their'} status couldn't be read` : ''}.
                 </motion.p>
               )}
+              {ranVia === 'browser' && control && control.status !== 200 && (
+                <motion.p variants={item} className="text-destructive text-xs">
+                  The control request to /api/whoami {control.status === 0 ? `got no answer (${control.error ?? 'network error'})` : `returned ${statusLabel(control.status)}`}, so it isn&rsquo;t clear the proxy is serving: unreadable attack answers can&rsquo;t be counted as blocked.
+                </motion.p>
+              )}
+              {sum.atkUnknown > 0 && (
+                <motion.p variants={item} className="text-muted-foreground text-xs">
+                  {sum.atkUnknown} {sum.atkUnknown === 1 ? 'attack' : 'attacks'} got no answer or one that couldn&rsquo;t be judged, and {sum.atkUnknown === 1 ? 'is' : 'are'} left out of the block rate.
+                </motion.p>
+              )}
               <motion.div variants={item} className="grid grid-cols-3 gap-2.5">
-                <Stat n={<>{blockRate.toFixed(0)}<Unit>%</Unit></>} label="Attacks blocked" tone={blockRate === 100 ? 'var(--chart-2)' : 'var(--chart-5)'} />
-                <Stat n={`${sum.atkBlocked}/${sum.atkTotal}`} label="Blocked / attacks" />
+                <Stat n={blockRate === null ? '—' : <>{blockRate.toFixed(0)}<Unit>%</Unit></>} label="Attacks blocked" tone={blockRate === null ? undefined : blockRate === 100 ? 'var(--chart-2)' : 'var(--chart-5)'} />
+                <Stat n={`${sum.atkBlocked}/${sum.atkTotal}`} label={sum.atkUnknown ? 'Blocked / judged' : 'Blocked / attacks'} />
                 <Stat n={sum.benBlocked} label="False positives" tone={sum.benBlocked ? 'var(--destructive)' : undefined} />
               </motion.div>
               <motion.div variants={item}>
@@ -1083,7 +1100,8 @@ function WafTab({ base, path, via, item, container }: { base: string; path: stri
                         <Td>{r.status ? statusLabel(r.status) : 'ERR'}</Td>
                         <Td>
                           {r.kind === 'attack'
-                            ? <Badge type={r.blocked ? 'info' : r.unreadable ? 'muted' : 'danger'}>{r.blocked ? 'blocked' : r.unreadable ? 'unknown' : 'passed'}</Badge>
+                            ? <Badge type={r.blocked ? 'info' : r.unreadable || !r.status ? 'muted' : 'danger'}>{r.blocked ? 'blocked' : !r.status ? 'error' : r.unreadable ? 'unknown' : 'passed'}</Badge>
+                            : !r.status ? <Badge type="muted">error</Badge>
                             : r.unreadable ? <Badge type="muted">unknown</Badge>
                             : <Badge type={r.blocked ? 'danger' : 'success'}>{r.blocked ? 'blocked (!)' : 'allowed'}</Badge>}
                         </Td>
