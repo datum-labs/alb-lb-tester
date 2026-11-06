@@ -202,34 +202,27 @@ curl -s -D - -o /dev/null "https://<proxy>/api/whoami"   -H "X-LBT-Resp-Header-1
 
 ## Run on Datum Compute
 
-Datum Compute runs unikernels, so the image is built with `datumctl compute build` from `Dockerfile.datum` rather than `docker build`. The final stage is distroless Node (the binary and the shared libraries it links against, no shell) running Next's standalone server; `--analyze` checks the entrypoint and its libraries before packaging.
-
-The **Compute image** workflow builds it on every push to `main` that touches the app and publishes `ghcr.io/datum-labs/alb-lb-tester:latest` and `:sha-<commit>`. To build by hand, with Docker running and a GHCR login that can write packages:
+The **Compute image** workflow builds `Dockerfile.datum` on every push to `main` that touches the app and publishes `ghcr.io/datum-labs/alb-lb-tester:container-latest` and `:container-sha-<commit>`. The final stage is distroless Node (no shell) running Next's standalone server. Run it on Compute's general-purpose runtime with **3 instances**, port `http` on **3000**, and environment `BACKEND_ID=compute`:
 
 ```bash
-datumctl compute build --analyze --push --output ghcr.io/<you>/alb-lb-tester:latest .
+datumctl compute deploy alb-lb-tester --image ghcr.io/datum-labs/alb-lb-tester:container-latest   --runtime-class general-purpose --location us-east-1 --min 3 --http-port 3000 --env BACKEND_ID=compute
 ```
 
-Then create a Compute workload from the image with **3 instances**, port `http` on **3000**, and environment `BACKEND_ID=compute`:
-
-```bash
-datumctl compute deploy alb-lb-tester --image ghcr.io/datum-labs/alb-lb-tester:latest \
-  --location us-central-1 --min 3 --http-port 3000 --env BACKEND_ID=compute
-```
+Compute keeps running the image it already pulled for an unchanged tag, so to move an existing workload to a newer build, deploy it again with that build's `container-sha-<commit>` tag.
 
 The server binds `::` because Compute instances only have IPv6 addresses; an image built before that fix needs `--env HOSTNAME=::`. Each instance picks its own id at start; set `INSTANCE_ID` to name them yourself. A deployment that only needs to be an origin, such as one behind a proxy that automated tests use, can set `ORIGIN_ONLY=1`: `/api/whoami` keeps answering, and the dashboard, `/api/inspect`, `/api/probe`, `/api/reach` and `/api/sticky-failure` return 404, so it doesn't expose public server-side fetch tools nobody there uses. The repository and its package are public, so the workload needs no image pull secret. A project without a network named `default` needs `--network <name> --yes`, which creates one.
 
 To put the dashboard behind a login, set `DASHBOARD_AUTH=user:password`. The dashboard, `/api/inspect`, `/api/probe` and `/api/reach` then need HTTP basic auth, and the inspector and probe may also reach `*.datum.internal` names, so a test can hit one instance directly. The login also turns on [sticky failure](#sticky-failure). `/api/whoami` stays open, since proxies, health checks and automated tests call it. The tools only take requests from the dashboard's own pages or from clients like curl, so another site can't use your saved login.
 
-### Regular container image
+### Other ways to run the image
 
-The same workflow also builds `Dockerfile.datum` with plain Docker and publishes it as `ghcr.io/datum-labs/alb-lb-tester:container-latest` and `:container-sha-<commit>`. The `latest` and `sha-*` tags are unikernel images and run only on Compute's default unikernel runtime; the `container-*` tags run anywhere a container does, including Compute's general-purpose runtime:
+The `container-*` images run anywhere a container does:
 
 ```bash
-datumctl compute deploy alb-lb-tester-gp --image ghcr.io/datum-labs/alb-lb-tester:container-latest   --runtime-class general-purpose --location us-east-1 --min 3 --http-port 3000 --env BACKEND_ID=compute-gp
-
 docker run -p 3000:3000 -e BACKEND_ID=local ghcr.io/datum-labs/alb-lb-tester:container-latest
 ```
+
+The workflow also publishes unikernel images, `:latest` and `:sha-<commit>`, built with `datumctl compute build --analyze`. They run only on Compute's default unikernel runtime, and the container images on the general-purpose runtime are the tested path.
 
 ## Notes
 
