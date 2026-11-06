@@ -11,11 +11,16 @@ export const runtime = 'nodejs';
 const coldStartAt = new Date().toISOString();
 let requestCount = 0;
 
+// The dashboard's browser mode reads these responses from other origins, and
+// its Headers tab compares every response header it can: `*` exposes them
+// all (except Set-Cookie, which a browser never reveals) to requests without
+// credentials, the only kind this origin answers cross-site. The names stay
+// listed for browsers that don't take the wildcard.
 const corsHeaders: Record<string, string> = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': '*',
-  'Access-Control-Expose-Headers': 'x-backend-id, x-instance-id, x-fail-mode',
+  'Access-Control-Expose-Headers': '*, x-backend-id, x-instance-id, x-fail-mode',
   'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0',
 };
 

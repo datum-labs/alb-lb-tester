@@ -1,7 +1,10 @@
-# PR #455 — ConsistentHash on the client source IP.
+# ConsistentHash on the client source IP.
 # From one machine every request shares a source IP, so all traffic sticks to
 # one backend (that IS the correct result). To see the hash spread you need
 # multiple client IPs.
+#
+# Needs the alb-lb-tester-a, -b and -c workloads (see "Quick start on Datum
+# Compute" in the README).
 apiVersion: networking.datumapis.com/v1alpha
 kind: HTTPProxy
 metadata:
@@ -13,6 +16,12 @@ spec:
       type: SourceIP
   rules:
     - backends:
-        - endpoint: https://alb-tester-a.vercel.app
-        - endpoint: https://alb-tester-b.vercel.app
-        - endpoint: https://alb-tester-c.vercel.app
+        - networkService:
+            name: alb-lb-tester-a
+            port: http
+        - networkService:
+            name: alb-lb-tester-b
+            port: http
+        - networkService:
+            name: alb-lb-tester-c
+            port: http

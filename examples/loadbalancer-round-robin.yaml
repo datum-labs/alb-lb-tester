@@ -1,6 +1,9 @@
-# PR #455 — load-balancing algorithm. RoundRobin cycles evenly across backends.
-# With equal (default) weights, expect a near-even split. Random and
+# Load-balancing algorithm. RoundRobin spreads requests evenly across
+# backends. With equal (default) weights, expect a near-even split. Random and
 # LeastRequest are drop-in swaps for spec.loadBalancer.type.
+#
+# Needs the alb-lb-tester-a, -b and -c workloads (see "Quick start on Datum
+# Compute" in the README).
 apiVersion: networking.datumapis.com/v1alpha
 kind: HTTPProxy
 metadata:
@@ -10,6 +13,12 @@ spec:
     type: RoundRobin        # or Random, or LeastRequest
   rules:
     - backends:
-        - endpoint: https://alb-tester-a.vercel.app
-        - endpoint: https://alb-tester-b.vercel.app
-        - endpoint: https://alb-tester-c.vercel.app
+        - networkService:
+            name: alb-lb-tester-a
+            port: http
+        - networkService:
+            name: alb-lb-tester-b
+            port: http
+        - networkService:
+            name: alb-lb-tester-c
+            port: http

@@ -34,11 +34,25 @@ import {
 import {
   diffHeaders,
   evidenceMarkdown,
+  foldHeaders,
   forwardingReport,
+  parseHeaderLines,
   SPOOFED_FORWARDING,
   type Change,
   type HeaderRow,
 } from './header-diff';
+import {
+  apiJson,
+  blockedAsMixedContent,
+  browserFetch,
+  forbiddenHeader,
+  isCrossOrigin,
+  messageOf,
+  originOf,
+  statusLabel,
+  UNREADABLE,
+  type Via,
+} from './browser-fetch';
 
 type Result = {
   n: number;
@@ -51,7 +65,7 @@ type Result = {
 };
 
 type KeyMode = 'none' | 'constant' | 'random' | 'sequential';
-type WafRow = { kind: 'attack' | 'benign'; label: string; status: number; blocked: boolean };
+type WafRow = { kind: 'attack' | 'benign'; label: string; status: number; blocked: boolean; unreadable?: boolean };
 
 const EASE = [0.23, 1, 0.32, 1] as const;
 const CHART = ['var(--chart-1)', 'var(--chart-2)', 'var(--chart-3)', 'var(--chart-4)', 'var(--chart-5)'];
@@ -102,6 +116,71 @@ type TabId = 'load' | 'inspect' | 'waf' | 'health' | 'timeouts' | 'sticky';
 const TAB_IDS: TabId[] = ['load', 'inspect', 'waf', 'health', 'timeouts', 'sticky'];
 const TAB_STORAGE_KEY = 'alb-tester:tab';
 
+/** What /api/reach said about a host: can the dashboard's server reach it? */
+type Reach = { host: string; reachable: boolean; onCompute: boolean };
+
+/**
+ * Asks the dashboard's server, once per host, whether it can reach the proxy,
+ * and switches the tests to the browser when it can't. A manual choice stands
+ * until the host changes; a reachable host only undoes an automatic switch.
+ */
+function useReach(base: string, via: Via, setVia: (v: Via) => void) {
+  const [reach, setReach] = useState<Reach | null>(null);
+  const [checking, setChecking] = useState<string | null>(null);
+  const cache = useRef(new Map<string, Reach>());
+  const auto = useRef(false);
+  const viaRef = useRef(via);
+  viaRef.current = via;
+
+  useEffect(() => {
+    let host: string;
+    try {
+      const u = new URL(base);
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error();
+      host = u.host;
+    } catch {
+      setReach(null);
+      return;
+    }
+    let cancelled = false;
+    const apply = (r: Reach) => {
+      if (cancelled) return;
+      setReach(r);
+      if (!r.reachable && viaRef.current === 'server') { setVia('browser'); auto.current = true; }
+      else if (r.reachable && auto.current) { setVia('server'); auto.current = false; }
+    };
+    const cached = cache.current.get(host);
+    if (cached) { apply(cached); return; }
+    setReach(null);
+    // Waits for typing to stop before asking.
+    const timer = setTimeout(async () => {
+      setChecking(host);
+      try {
+        const res = await fetch(`/api/reach?${new URLSearchParams({ url: base })}`, { cache: 'no-store' });
+        const data = await apiJson(res);
+        if (res.ok && typeof data.reachable === 'boolean') {
+          const r: Reach = { host, reachable: data.reachable, onCompute: data.onCompute === true };
+          if (r.reachable) cache.current.set(host, r);
+          apply(r);
+        }
+      } catch {
+        // No answer from our own server (an older one without /api/reach, a
+        // login prompt): leave the mode as it is.
+      }
+      if (!cancelled) setChecking(null);
+    }, 500);
+    return () => { cancelled = true; clearTimeout(timer); setChecking(null); };
+  }, [base, setVia]);
+
+  /** A choice made by hand, kept until the host changes. */
+  function choose(v: Via) {
+    auto.current = false;
+    setVia(v);
+  }
+
+  return { reach, checking, choose };
+}
+
 /** stickyEnabled: the sticky failure API is on (behind DASHBOARD_AUTH, not ORIGIN_ONLY). */
 export function Dashboard({ stickyEnabled }: { stickyEnabled: boolean }) {
   const [proxyUrl, setProxyUrl] = useState('');
@@ -124,6 +203,9 @@ export function Dashboard({ stickyEnabled }: { stickyEnabled: boolean }) {
 
   const base = useMemo(() => proxyUrl.trim().replace(/\/+$/, ''), [proxyUrl]);
   const target = (p = path) => `${base}${p.startsWith('/') ? '' : '/'}${p}`;
+  const [via, setVia] = useState<Via>('server');
+  const { reach, checking, choose } = useReach(base, via, setVia);
+  const unreachable = reach && !reach.reachable ? reach : null;
 
   const item = reduce
     ? { hidden: { opacity: 0 }, show: { opacity: 1 } }
@@ -141,6 +223,29 @@ export function Dashboard({ stickyEnabled }: { stickyEnabled: boolean }) {
           <div className="space-y-1.5">
             <Label htmlFor="path">Request path</Label>
             <Input id="path" value={path} onChange={(e) => setPath(e.target.value)} />
+          </div>
+          <div className="space-y-1.5 sm:col-span-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-sm font-medium">Send test traffic from:</span>
+              {(['server', 'browser'] as const).map((v) => (
+                <Button key={v} size="small" theme={via === v ? 'solid' : 'outline'} aria-pressed={via === v} onClick={() => choose(v)}>
+                  {v === 'server' ? 'Server' : 'Browser'}
+                </Button>
+              ))}
+              {checking && <span className="text-muted-foreground text-xs">Checking whether this dashboard&rsquo;s server can reach {checking}&hellip;</span>}
+            </div>
+            <p className="text-muted-foreground text-xs">
+              For Headers &amp; redirect, WAF probes, Health checks and Timeouts &amp; retries. The server reads every status and header; your browser can&rsquo;t send or read some of them. Load balancing always runs from your browser, Sticky failure always from the server.
+            </p>
+            {unreachable && (
+              <p className="rounded-md px-3 py-2 text-xs" style={{ background: 'color-mix(in oklch, var(--chart-4) 14%, var(--card))' }}>
+                {unreachable.onCompute
+                  ? <>This dashboard runs on Datum Compute, which can&rsquo;t currently reach Datum&rsquo;s edge, and its server can&rsquo;t reach <span className="font-mono">{unreachable.host}</span>, so tests run from your browser.</>
+                  : <>This dashboard&rsquo;s server can&rsquo;t reach <span className="font-mono">{unreachable.host}</span>, so tests run from your browser.</>}
+                {' '}Some header tests aren&rsquo;t available in browser mode.
+                {via === 'server' && ' You switched back to the server, so expect these tests to fail.'}
+              </p>
+            )}
           </div>
         </CardContent>
       </Card>
@@ -165,25 +270,25 @@ export function Dashboard({ stickyEnabled }: { stickyEnabled: boolean }) {
 
         <TabsContent value="inspect" forceMount className="mt-4 data-[state=inactive]:hidden">
           <Activity mode={tab === 'inspect' ? 'visible' : 'hidden'}>
-            <InspectTab base={base} target={target} item={item} container={container} />
+            <InspectTab base={base} target={target} via={via} item={item} container={container} />
           </Activity>
         </TabsContent>
 
         <TabsContent value="waf" forceMount className="mt-4 data-[state=inactive]:hidden">
           <Activity mode={tab === 'waf' ? 'visible' : 'hidden'}>
-            <WafTab base={base} path={path} item={item} container={container} />
+            <WafTab base={base} path={path} via={via} item={item} container={container} />
           </Activity>
         </TabsContent>
 
         <TabsContent value="health" forceMount className="mt-4 data-[state=inactive]:hidden">
           <Activity mode={tab === 'health' ? 'visible' : 'hidden'}>
-            <HealthTab base={base} target={target} item={item} container={container} />
+            <HealthTab base={base} target={target} via={via} item={item} container={container} />
           </Activity>
         </TabsContent>
 
         <TabsContent value="timeouts" forceMount className="mt-4 data-[state=inactive]:hidden">
           <Activity mode={tab === 'timeouts' ? 'visible' : 'hidden'}>
-            <TimeoutsTab base={base} target={target} item={item} container={container} />
+            <TimeoutsTab base={base} target={target} via={via} item={item} container={container} />
           </Activity>
         </TabsContent>
 
@@ -507,7 +612,104 @@ const HEADER_PRESETS: HeaderPreset[] = [
 const linesOf = (pairs?: [string, string][]) => (pairs ?? []).map(([k, v]) => `${k}: ${v}`).join('\n');
 const nonEmpty = (text: string) => text.split('\n').map((l) => l.trim()).filter(Boolean);
 
-function InspectTab({ base, target, item, container }: { base: string; target: (p?: string) => string; item: Variants; container: Variants }) {
+/**
+ * Why a header can't be used from the browser, or null. Request headers the
+ * browser won't send; Set-Cookie it never lets a page read; and from another
+ * origin, CORS headers the origin is asked to send would replace the ones the
+ * browser needs to read the answer at all.
+ */
+function browserHeaderProblem(name: string, side: 'request' | 'response', crossOrigin: boolean): string | null {
+  const n = name.toLowerCase();
+  if (side === 'request') return forbiddenHeader(n) ? 'a browser can\'t send it' : null;
+  if (n === 'set-cookie') return 'a browser can\'t read Set-Cookie';
+  if (crossOrigin && n.startsWith('access-control-')) return 'from another origin it would replace the CORS headers the browser needs to read the answer';
+  return null;
+}
+
+function presetProblem(p: HeaderPreset, crossOrigin: boolean): string | null {
+  for (const [k] of p.request ?? []) { const why = browserHeaderProblem(k, 'request', crossOrigin); if (why) return why; }
+  for (const [k] of p.response ?? []) { const why = browserHeaderProblem(k, 'response', crossOrigin); if (why) return why; }
+  return null;
+}
+
+/** The lines in a header box that can't be used from the browser, and why. */
+function lineProblems(text: string, side: 'request' | 'response', crossOrigin: boolean) {
+  return parseHeaderLines(nonEmpty(text)).headers
+    .map(([k, v]) => ({ line: `${k}: ${v}`, reason: browserHeaderProblem(k, side, crossOrigin) }))
+    .filter((x): x is { line: string; reason: string } => x.reason !== null);
+}
+
+/**
+ * The inspection, run from the browser, in the shape /api/inspect returns.
+ * What the origin received comes from /api/whoami's echo; what arrived is
+ * whatever response headers the browser can read.
+ */
+async function browserInspect(url: string, reqText: string, respText: string) {
+  const crossOrigin = isCrossOrigin(url);
+  const u = new URL(url);
+  const req = parseHeaderLines(nonEmpty(reqText));
+  const resp = parseHeaderLines(nonEmpty(respText));
+  const rejected = [...req.rejected, ...resp.rejected];
+  const keep = (pairs: [string, string][], side: 'request' | 'response') => pairs.filter(([k, v]) => {
+    const why = browserHeaderProblem(k, side, crossOrigin);
+    if (why) rejected.push({ line: `${k}: ${v}`, reason: why });
+    return !why;
+  });
+  const send = keep(req.headers, 'request');
+  const ask = keep(resp.headers, 'response');
+  const headers = new Headers();
+  for (const [k, v] of send) headers.append(k, v);
+  ask.forEach(([k, v], i) => headers.append(`X-LBT-Resp-Header-${i + 1}`, `${k}: ${v}`));
+
+  const r = await browserFetch(url, { headers });
+  let get: Record<string, unknown>;
+  if (!r.res) {
+    get = { error: r.error ?? 'No answer' };
+  } else {
+    const res = r.res;
+    const responseHeaders: Record<string, string> = {};
+    res.headers.forEach((v, k) => { responseHeaders[k] = v; });
+    const { backendId, body: j } = await originOf(res);
+    const obj = j && typeof j === 'object' ? j : {};
+    get = {
+      ok: res.ok,
+      status: res.status,
+      ms: Math.round(r.ms),
+      finalUrl: res.url,
+      backendId,
+      // Only what was set here: the browser adds its own headers, which a page can't list.
+      requestSent: { host: u.host, ...foldHeaders(send) },
+      requestHeadersSeen: obj.headers && typeof obj.headers === 'object' ? obj.headers : null,
+      originSent: obj.sentHeaders && typeof obj.sentHeaders === 'object' ? obj.sentHeaders : null,
+      responseHeaders,
+      rejectedRespHeaders: Array.isArray(obj.rejectedRespHeaders) ? obj.rejectedRespHeaders : undefined,
+      originRuntimeHeaders: Array.isArray(obj.runtimeHeaders) ? obj.runtimeHeaders : undefined,
+      originHeadersRaw: typeof obj.headersRaw === 'boolean' ? obj.headersRaw : undefined,
+      // From another origin, the browser shows only the response headers the
+      // origin exposes; this tester's /api/whoami exposes them all (`*`).
+      allReadable: !crossOrigin || /(^|,)\s*\*\s*(,|$)/.test(responseHeaders['access-control-expose-headers'] ?? ''),
+    };
+  }
+
+  // The browser follows redirects itself and shows only where it ended up.
+  const httpUrl = `http://${u.host}${u.pathname}${u.search}`;
+  let redirect: Record<string, unknown>;
+  if (blockedAsMixedContent(httpUrl)) {
+    redirect = { from: httpUrl, error: 'an https page can\'t request http:// URLs' };
+  } else {
+    const h = u.protocol === 'http:' ? r : await browserFetch(httpUrl);
+    redirect = h.res
+      ? { from: httpUrl, finalUrl: h.res.url, redirected: h.res.redirected && h.res.url.startsWith('https:'), status: h.res.status }
+      : { from: httpUrl, error: h.error };
+  }
+  return { browser: true, rejectedRequestHeaders: rejected, get, redirect };
+}
+
+/** Only the named headers of a set. */
+const pick = (h: Record<string, string>, names: string[]) =>
+  Object.fromEntries(Object.entries(h).filter(([k]) => names.includes(k)));
+
+function InspectTab({ base, target, via, item, container }: { base: string; target: (p?: string) => string; via: Via; item: Variants; container: Variants }) {
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState<any>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -517,6 +719,12 @@ function InspectTab({ base, target, item, container }: { base: string; target: (
   const [ranAt, setRanAt] = useState<Date | null>(null);
   const [inspected, setInspected] = useState('');
   const [copied, setCopied] = useState(false);
+
+  const crossOrigin = useMemo(() => !!base && isCrossOrigin(base), [base]);
+  const browser = via === 'browser';
+  const problems = browser
+    ? [...lineProblems(reqText, 'request', crossOrigin), ...lineProblems(respText, 'response', crossOrigin)]
+    : [];
 
   function pickPreset(v: string) {
     const p = HEADER_PRESETS.find((x) => x.value === v)!;
@@ -532,14 +740,20 @@ function InspectTab({ base, target, item, container }: { base: string; target: (
       // The inspector sends the request headers, plus numbered
       // X-LBT-Resp-Header ones asking the origin for the response headers.
       const u = new URL(target());
-      const q = new URLSearchParams({ url: u.toString() });
-      for (const l of nonEmpty(reqText)) q.append('h', l);
-      nonEmpty(respText).forEach((l, i) => q.append('h', `X-LBT-Resp-Header-${i + 1}: ${l}`));
-      const res = await fetch(`/api/inspect?${q}`, { cache: 'no-store' });
-      setData(await res.json());
+      if (browser) {
+        setData(await browserInspect(u.toString(), reqText, respText));
+      } else {
+        const q = new URLSearchParams({ url: u.toString() });
+        for (const l of nonEmpty(reqText)) q.append('h', l);
+        nonEmpty(respText).forEach((l, i) => q.append('h', `X-LBT-Resp-Header-${i + 1}: ${l}`));
+        const res = await fetch(`/api/inspect?${q}`, { cache: 'no-store' });
+        const json = await apiJson(res);
+        if (!res.ok) throw new Error(json?.error ?? `The dashboard's server answered HTTP ${res.status}`);
+        setData(json);
+      }
       setRanAt(new Date());
       setInspected(u.toString());
-    } catch (e) { setErr(String(e)); }
+    } catch (e) { setErr(messageOf(e)); }
     setLoading(false);
   }
 
@@ -555,9 +769,22 @@ function InspectTab({ base, target, item, container }: { base: string; target: (
   const redirect = data?.redirect;
   const rejected = [...(data?.rejectedRequestHeaders ?? []), ...(get?.rejectedRespHeaders ?? [])] as { line: string; reason: string }[];
 
-  const requestLeg = useMemo(() => (sent && seen ? diffHeaders(sent, seen) : null), [sent, seen]);
+  // From the browser, only the headers set here can be compared: the browser
+  // adds its own, which a page can't list. Set-Cookie can't be read at all,
+  // and from an origin that doesn't expose every header, neither can the rest.
+  const fromBrowser = data?.browser === true;
+  const allReadable = get?.allReadable !== false;
+  const requestLeg = useMemo(() => {
+    if (!sent || !seen) return null;
+    return diffHeaders(sent, fromBrowser ? pick(seen, Object.keys(sent)) : seen);
+  }, [sent, seen, fromBrowser]);
   const runtimeHeaders = get?.originRuntimeHeaders as string[] | undefined;
-  const responseLeg = useMemo(() => (originSent && resp ? diffHeaders(originSent, resp, runtimeHeaders) : null), [originSent, resp, runtimeHeaders]);
+  const responseLeg = useMemo(() => {
+    if (!originSent || !resp) return null;
+    if (!fromBrowser) return diffHeaders(originSent, resp, runtimeHeaders);
+    const readable = Object.keys(originSent).filter((k) => k !== 'set-cookie' && (allReadable || k in resp));
+    return diffHeaders(pick(originSent, readable), allReadable ? resp : pick(resp, readable), runtimeHeaders);
+  }, [originSent, resp, runtimeHeaders, fromBrowser, allReadable]);
   const forwarding = useMemo(() => {
     if (!sent || !seen || !SPOOFED_FORWARDING.some(([k]) => k in sent)) return null;
     return forwardingReport(sent, seen);
@@ -574,13 +801,21 @@ function InspectTab({ base, target, item, container }: { base: string; target: (
       <Card>
         <CardHeader><CardTitle className="text-sm">Inspect</CardTitle></CardHeader>
         <CardContent className="space-y-3">
-          <p className="text-muted-foreground text-xs">Fetches the target from the server and compares the headers on each side of the edge: what was sent against what the origin received, and what the origin sent back against what arrived. Also checks HSTS and whether http redirects to https.</p>
+          <p className="text-muted-foreground text-xs">Fetches the target from {browser ? 'your browser' : 'the server'} and compares the headers on each side of the edge: what was sent against what the origin received, and what the origin sent back against what arrived. Also checks HSTS and whether http redirects to https.</p>
+          {browser && (
+            <p className="text-muted-foreground text-xs">
+              From your browser: it won&rsquo;t send some headers (Cookie, Host, Origin, Referer, Sec-*, &hellip;), adds its own, and can&rsquo;t read Set-Cookie. So the request comparison covers only the headers you set, and the response comparison only what the browser can read.{crossOrigin && ' The target is on another origin, so it has to be this tester\'s /api/whoami, which sends CORS headers.'}
+            </p>
+          )}
           <div className="space-y-1.5">
             <Label>Preset</Label>
             <Select value={preset} onValueChange={pickPreset}>
               <SelectTrigger className="w-full"><SelectValue /></SelectTrigger>
               <SelectContent>
-                {HEADER_PRESETS.map((p) => <SelectItem key={p.value} value={p.value}>{p.label}</SelectItem>)}
+                {HEADER_PRESETS.map((p) => {
+                  const why = browser ? presetProblem(p, crossOrigin) : null;
+                  return <SelectItem key={p.value} value={p.value} disabled={!!why}>{p.label}{why && ` — server only: ${why}`}</SelectItem>;
+                })}
               </SelectContent>
             </Select>
           </div>
@@ -593,6 +828,11 @@ function InspectTab({ base, target, item, container }: { base: string; target: (
             <Textarea id="resp-headers" rows={4} className="font-mono text-xs" placeholder="Server: my-app" value={respText} onChange={(e) => setRespText(e.target.value)} />
             <p className="text-muted-foreground text-[11px]">One <span className="font-mono">Name: Value</span> per line. Repeat a name to send it twice. Origin headers only work when the target is this tester's <span className="font-mono">/api/whoami</span>.</p>
           </div>
+          {problems.length > 0 && (
+            <div className="space-y-0.5 text-xs" style={{ color: 'var(--chart-5)' }}>
+              {problems.map((p, i) => <div key={i}>Server only, won&rsquo;t be sent: <span className="font-mono">{p.line}</span> ({p.reason})</div>)}
+            </div>
+          )}
           <Button block loading={loading} onClick={run}>Inspect target</Button>
           {err && <p className="text-destructive text-xs">{err}</p>}
         </CardContent>
@@ -619,6 +859,13 @@ function InspectTab({ base, target, item, container }: { base: string; target: (
               {rejected.length > 0 && (
                 <motion.div variants={item} className="text-destructive space-y-0.5 text-xs">
                   {rejected.map((r, i) => <div key={i}>Not sent: <span className="font-mono">{r.line}</span> ({r.reason})</div>)}
+                </motion.div>
+              )}
+
+              {fromBrowser && (
+                <motion.div variants={item} className="text-muted-foreground rounded-md px-3 py-2.5 text-xs" style={{ background: 'var(--muted)' }}>
+                  Measured from your browser. Only the request headers you set are compared, since the browser adds its own; Set-Cookie can&rsquo;t be read, so it&rsquo;s left out.
+                  {!allReadable && ' This origin doesn\'t expose all its response headers to other sites, so only the ones the browser could read are compared.'}
                 </motion.div>
               )}
 
@@ -666,15 +913,19 @@ function InspectTab({ base, target, item, container }: { base: string; target: (
                 <motion.div variants={item} className="rounded-md px-3 py-2.5 text-sm"
                   style={{ background: `color-mix(in oklch, ${redirect.redirected ? 'var(--chart-2)' : 'var(--muted)'} ${redirect.redirected ? '12%' : '100%'}, var(--card))` }}>
                   <span className="text-muted-foreground">http → https: </span>
-                  {redirect.error ? <span>could not probe</span>
+                  {redirect.error ? <span>could not probe{fromBrowser && <span className="text-muted-foreground"> ({redirect.error})</span>}</span>
+                    : fromBrowser ? (redirect.redirected
+                      ? <span>followed to <span className="font-mono">{redirect.finalUrl}</span> <span className="text-muted-foreground">(a browser doesn&rsquo;t show the redirect status)</span></span>
+                      : <span>no redirect to https (ended at <span className="font-mono">{redirect.finalUrl}</span>, status {redirect.status})</span>)
                     : redirect.redirected ? <span><span className="font-mono">{redirect.status}</span> → <span className="font-mono">{redirect.location}</span></span>
                     : <span>no redirect (status {redirect.status})</span>}
                 </motion.div>
               )}
 
-              {requestLeg
-                ? <motion.div variants={item}><DiffTable title="Request" before="Sent" after="Origin got" rows={requestLeg} /></motion.div>
-                : seen && <motion.div variants={item}><HeaderTable title="Request headers the origin saw" headers={seen} highlight={['host', 'x-forwarded-for', 'x-forwarded-proto', 'x-envoy-external-address', 'x-request-id']} /></motion.div>}
+              {requestLeg && <motion.div variants={item}><DiffTable title="Request" before="Sent" after="Origin got" rows={requestLeg} /></motion.div>}
+              {seen && (!requestLeg || fromBrowser) && (
+                <motion.div variants={item}><HeaderTable title={fromBrowser ? 'Everything the origin received, browser headers included' : 'Request headers the origin saw'} headers={seen} highlight={['host', 'x-forwarded-for', 'x-forwarded-proto', 'x-envoy-external-address', 'x-request-id']} /></motion.div>
+              )}
               {responseLeg
                 ? <motion.div variants={item}><DiffTable title="Response" before="Origin sent" after="Client got" rows={responseLeg} /></motion.div>
                 : resp && <motion.div variants={item}><HeaderTable title="Response headers from the proxy" headers={resp} highlight={['strict-transport-security', 'server', 'x-envoy-upstream-service-time']} /></motion.div>}
@@ -729,29 +980,53 @@ function DiffTable({ title, before, after, rows }: { title: string; before: stri
 
 /* ------------------------------------------------------------------ WAF tab */
 
-function WafTab({ base, path, item, container }: { base: string; path: string; item: Variants; container: Variants }) {
+function WafTab({ base, path, via, item, container }: { base: string; path: string; via: Via; item: Variants; container: Variants }) {
   const [running, setRunning] = useState(false);
   const [rows, setRows] = useState<WafRow[]>([]);
   const [note, setNote] = useState<string | null>(null);
+  const [ranVia, setRanVia] = useState<Via>('server');
+  // The browser-mode control request's answer, shown when it wasn't a readable 200.
+  const [control, setControl] = useState<{ status: number; error?: string } | null>(null);
 
   async function run() {
     if (!base) { setNote('Enter the proxy base URL above first.'); return; }
-    setRunning(true); setNote(null); setRows([]);
+    setRunning(true); setNote(null); setRows([]); setRanVia(via); setControl(null);
     const out: WafRow[] = [];
+    // From the browser, another origin's block page has no CORS headers, so
+    // its status can't be read. When the attacks go to /api/whoami, which
+    // always sends them, an unreadable answer is a block only when a benign
+    // /api/whoami control in this run was readable with 200.
+    const attacksHitWhoami = /^\/?api\/whoami\b/.test(path);
     const attackUrl = (a: (typeof ATTACKS)[number]) => `${base}${path.startsWith('/') ? '' : '/'}${path}?${a.key}=${encodeURIComponent(a.value)}`;
     const jobs: { kind: 'attack' | 'benign'; label: string; url: string }[] = [
       ...ATTACKS.map((a) => ({ kind: 'attack' as const, label: a.label, url: attackUrl(a) })),
       ...BENIGN.map((b) => ({ kind: 'benign' as const, label: b.label, url: `${base}${b.path}` })),
     ];
+    let proxyServing = false;
+    if (via === 'browser' && attacksHitWhoami) {
+      const control = await browserFetch(`${base}/api/whoami`);
+      await control.res?.body?.cancel();
+      proxyServing = control.status === 200;
+      setControl({ status: control.status, error: control.error });
+    }
     for (const j of jobs) {
       let status = 0;
+      if (via === 'browser') {
+        const r = await browserFetch(j.url);
+        await r.res?.body?.cancel();
+        status = r.status;
+        const unreadable = status === UNREADABLE;
+        out.push({ kind: j.kind, label: j.label, status, unreadable, blocked: status === 403 || (unreadable && j.kind === 'attack' && proxyServing) });
+        setRows(out.slice());
+        continue;
+      }
       // Probe server-side: a WAF 403 (or a plain HTML 200) carries no CORS
       // headers, so a direct browser fetch cannot read its status.
       try {
         const res = await fetch(`/api/probe?url=${encodeURIComponent(j.url)}`, { cache: 'no-store' });
-        const data = await res.json();
+        const data = await apiJson(res);
         status = typeof data.status === 'number' ? data.status : 0;
-      } catch { status = 0; }
+      } catch (e) { status = 0; setNote(messageOf(e)); }
       out.push({ kind: j.kind, label: j.label, status, blocked: status === 403 });
       setRows(out.slice());
     }
@@ -759,14 +1034,19 @@ function WafTab({ base, path, item, container }: { base: string; path: string; i
   }
 
   const sum = useMemo(() => {
+    // An attack with no answer, or one that couldn't be read and wasn't
+    // counted as blocked, is unknown, and left out of the block rate rather
+    // than read as passed.
     const atk = rows.filter((r) => r.kind === 'attack');
+    const judged = atk.filter((r) => r.blocked || (!r.unreadable && r.status !== 0));
     const ben = rows.filter((r) => r.kind === 'benign');
     return {
-      atkTotal: atk.length, atkBlocked: atk.filter((r) => r.blocked).length,
+      atkTotal: judged.length, atkBlocked: judged.filter((r) => r.blocked).length, atkUnknown: atk.length - judged.length,
       benTotal: ben.length, benBlocked: ben.filter((r) => r.blocked).length,
+      unreadable: rows.filter((r) => r.unreadable).length,
     };
   }, [rows]);
-  const blockRate = sum.atkTotal ? (sum.atkBlocked / sum.atkTotal) * 100 : 0;
+  const blockRate = sum.atkTotal ? (sum.atkBlocked / sum.atkTotal) * 100 : null;
 
   return (
     <div className="grid items-start gap-4 md:grid-cols-[340px_1fr]">
@@ -774,6 +1054,9 @@ function WafTab({ base, path, item, container }: { base: string; path: string; i
         <CardHeader><CardTitle className="text-sm">WAF probes</CardTitle></CardHeader>
         <CardContent className="space-y-3">
           <p className="text-muted-foreground text-xs">Sends {ATTACKS.length} attack payloads (XSS, SQLi, command injection, traversal) and {BENIGN.length} benign requests. A protected proxy blocks the attacks with 403 and lets the benign ones through.</p>
+          {via === 'browser' && (
+            <p className="text-muted-foreground text-xs">From your browser. From another origin, a block page has no CORS headers, so its status can&rsquo;t be read: with the request path on <span className="font-mono">/api/whoami</span>, an attack that gets an unreadable answer counts as blocked only if a benign request to that path was readable with 200 first, otherwise it shows as unknown. An unreadable benign answer isn&rsquo;t judged.</p>
+          )}
           <Button block loading={running} onClick={run}>Run WAF probes</Button>
           {note && <p className="text-destructive text-xs">{note}</p>}
         </CardContent>
@@ -786,9 +1069,24 @@ function WafTab({ base, path, item, container }: { base: string; path: string; i
             <div className="text-muted-foreground py-12 text-center text-sm">No probes yet.</div>
           ) : (
             <motion.div className="space-y-5" variants={container} initial="hidden" animate="show">
+              {ranVia === 'browser' && (
+                <motion.p variants={item} className="text-muted-foreground text-xs">
+                  Measured from your browser{sum.unreadable ? `; ${sum.unreadable} ${sum.unreadable === 1 ? 'answer' : 'answers'} had no CORS headers, so ${sum.unreadable === 1 ? 'its' : 'their'} status couldn't be read` : ''}.
+                </motion.p>
+              )}
+              {ranVia === 'browser' && control && control.status !== 200 && (
+                <motion.p variants={item} className="text-destructive text-xs">
+                  The control request to /api/whoami {control.status === 0 ? `got no answer (${control.error ?? 'network error'})` : `returned ${statusLabel(control.status)}`}, so it isn&rsquo;t clear the proxy is serving: unreadable attack answers can&rsquo;t be counted as blocked.
+                </motion.p>
+              )}
+              {sum.atkUnknown > 0 && (
+                <motion.p variants={item} className="text-muted-foreground text-xs">
+                  {sum.atkUnknown} {sum.atkUnknown === 1 ? 'attack' : 'attacks'} got no answer or one that couldn&rsquo;t be judged, and {sum.atkUnknown === 1 ? 'is' : 'are'} left out of the block rate.
+                </motion.p>
+              )}
               <motion.div variants={item} className="grid grid-cols-3 gap-2.5">
-                <Stat n={<>{blockRate.toFixed(0)}<Unit>%</Unit></>} label="Attacks blocked" tone={blockRate === 100 ? 'var(--chart-2)' : 'var(--chart-5)'} />
-                <Stat n={`${sum.atkBlocked}/${sum.atkTotal}`} label="Blocked / attacks" />
+                <Stat n={blockRate === null ? '—' : <>{blockRate.toFixed(0)}<Unit>%</Unit></>} label="Attacks blocked" tone={blockRate === null ? undefined : blockRate === 100 ? 'var(--chart-2)' : 'var(--chart-5)'} />
+                <Stat n={`${sum.atkBlocked}/${sum.atkTotal}`} label={sum.atkUnknown ? 'Blocked / judged' : 'Blocked / attacks'} />
                 <Stat n={sum.benBlocked} label="False positives" tone={sum.benBlocked ? 'var(--destructive)' : undefined} />
               </motion.div>
               <motion.div variants={item}>
@@ -799,10 +1097,12 @@ function WafTab({ base, path, item, container }: { base: string; path: string; i
                       <tr key={i}>
                         <Td>{r.label}</Td>
                         <Td className="text-muted-foreground">{r.kind}</Td>
-                        <Td>{r.status || 'ERR'}</Td>
+                        <Td>{r.status ? statusLabel(r.status) : 'ERR'}</Td>
                         <Td>
                           {r.kind === 'attack'
-                            ? <Badge type={r.blocked ? 'info' : 'danger'}>{r.blocked ? 'blocked' : 'passed'}</Badge>
+                            ? <Badge type={r.blocked ? 'info' : r.unreadable || !r.status ? 'muted' : 'danger'}>{r.blocked ? 'blocked' : !r.status ? 'error' : r.unreadable ? 'unknown' : 'passed'}</Badge>
+                            : !r.status ? <Badge type="muted">error</Badge>
+                            : r.unreadable ? <Badge type="muted">unknown</Badge>
                             : <Badge type={r.blocked ? 'danger' : 'success'}>{r.blocked ? 'blocked (!)' : 'allowed'}</Badge>}
                         </Td>
                       </tr>
@@ -884,34 +1184,45 @@ function unitFor(target: string, backendId: string | null, instanceId: string | 
   return backendId;
 }
 
-type ProbeResult = { status: number; ms: number; backendId: string | null; instanceId: string | null };
+type ProbeResult = { status: number; ms: number; backendId: string | null; instanceId: string | null; error?: string };
 
 /**
  * Probe server-side: a 5xx the proxy generates itself has no CORS headers, so
  * the browser couldn't read it (or tell it apart from a backend's). timeoutMs
  * raises the probe's own limit, for requests expected to outlast the default.
+ *
+ * From the browser instead, such an answer from another origin is recorded as
+ * UNREADABLE: counted as the proxy's own error, its status unknown. On the
+ * dashboard's own origin every status is readable.
  */
-async function probe(url: string, timeoutMs?: number): Promise<ProbeResult> {
+async function probe(url: string, via: Via, timeoutMs?: number): Promise<ProbeResult> {
+  if (via === 'browser') {
+    const r = await browserFetch(url, { timeoutMs: timeoutMs ?? 12_000 });
+    const ids = r.res ? await originOf(r.res) : { backendId: null, instanceId: null };
+    // Timed when the answer started, like the server's probe.
+    return { status: r.status, ms: Math.round(r.ms), backendId: ids.backendId, instanceId: ids.instanceId, error: r.status ? undefined : r.error };
+  }
   const query = new URLSearchParams({ url });
   if (timeoutMs) query.set('timeoutMs', String(timeoutMs));
   try {
     const res = await fetch(`/api/probe?${query}`, { cache: 'no-store' });
-    const data = await res.json();
+    const data = await apiJson(res);
     return {
       status: typeof data.status === 'number' ? data.status : 0,
       ms: typeof data.ms === 'number' ? data.ms : 0,
       backendId: (data.backendId as string | null) ?? null,
       instanceId: (data.instanceId as string | null) ?? null,
+      error: typeof data.error === 'string' ? data.error : undefined,
     };
-  } catch {
-    return { status: 0, ms: 0, backendId: null, instanceId: null };
+  } catch (e) {
+    return { status: 0, ms: 0, backendId: null, instanceId: null, error: messageOf(e) };
   }
 }
 
-type Detected = { backends: string[]; instances: string[] };
+type Detected = { backends: string[]; instances: string[]; error?: string };
 
 /** Lists the backends behind the proxy, and the instances of any backend with several. */
-function useDetect(target: (p?: string) => string) {
+function useDetect(target: (p?: string) => string, via: Via) {
   const [detected, setDetected] = useState<Detected>({ backends: [], instances: [] });
   const [detecting, setDetecting] = useState(false);
 
@@ -921,7 +1232,7 @@ function useDetect(target: (p?: string) => string) {
     const results = await Promise.all(Array.from({ length: 40 }, (_, n) => {
       const url = new URL(target());
       url.searchParams.set('_', String(n));
-      return probe(url.toString());
+      return probe(url.toString(), via);
     }));
     const backends = [...new Set(results.map((r) => r.backendId).filter((id): id is string => !!id))].sort();
     const instancesBy = new Map<string, Set<string>>();
@@ -933,7 +1244,7 @@ function useDetect(target: (p?: string) => string) {
     const instances = [...instancesBy.entries()]
       .filter(([, ids]) => ids.size > 1)
       .flatMap(([backend, ids]) => [...ids].sort().map((id) => `${backend}${INSTANCE_SEP}${id}`));
-    const found = { backends, instances };
+    const found = { backends, instances, error: backends.length ? undefined : results.find((r) => r.error)?.error };
     setDetected(found);
     setDetecting(false);
     return found;
@@ -980,9 +1291,19 @@ function TargetPicker({
   );
 }
 
+/** Says where a run's requests came from, for one sent from the browser. */
+function FromBrowserNote({ errors }: { errors: string | null }) {
+  return (
+    <p className="text-muted-foreground text-xs">
+      Measured from your browser, so the timings are from your machine. From another origin, an answer the proxy generates itself has no CORS headers: it&rsquo;s counted as the proxy&rsquo;s own error, status unreadable.
+      {errors && <> First request error: {errors}</>}
+    </p>
+  );
+}
+
 function HealthTab({
-  base, target, item, container,
-}: { base: string; target: (p?: string) => string; item: Variants; container: Variants }) {
+  base, target, via, item, container,
+}: { base: string; target: (p?: string) => string; via: Via; item: Variants; container: Variants }) {
   const [failTarget, setFailTarget] = useState('');
   const [mode, setMode] = useState<HealthMode>('error');
   const [failStatus, setFailStatus] = useState(503);
@@ -994,13 +1315,14 @@ function HealthTab({
   const [baselineS, setBaselineS] = useState(10);
   const [failingS, setFailingS] = useState(40);
   const [recoveryS, setRecoveryS] = useState(70);
-  const { detected, detecting, detect: detectTargets } = useDetect(target);
+  const { detected, detecting, detect: detectTargets } = useDetect(target, via);
   const [running, setRunning] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [samples, setSamples] = useState<HealthSample[]>([]);
+  const firstError = useRef<string | null>(null);
   // Settings of the run on screen, so editing the form doesn't re-analyse it.
   const [runConfig, setRunConfig] = useState<{
-    target: string; mode: HealthMode; failPercent: number; baselineS: number; failingS: number; totalS: number; rate: number;
+    target: string; mode: HealthMode; failPercent: number; baselineS: number; failingS: number; totalS: number; rate: number; via: Via;
   } | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const cancel = useRef(false);
@@ -1028,8 +1350,8 @@ function HealthTab({
   async function detect() {
     if (!base) { setNote('Enter the proxy base URL above first.'); return; }
     setNote(null);
-    const { backends, instances } = await detectTargets();
-    if (!backends.length) setNote('No backend answered. Check the proxy URL and path.');
+    const { backends, instances, error } = await detectTargets();
+    if (!backends.length) setNote(`No backend answered. Check the proxy URL and path.${error ? ` (${error})` : ''}`);
     else if (!failTarget) setFailTarget(instances[0] ?? backends[backends.length - 1]);
   }
 
@@ -1046,8 +1368,9 @@ function HealthTab({
     const giveUpMs = mode === 'error' ? undefined : SLOW_GIVE_UP_MS;
 
     setRunning(true); setNote(null); setSamples([]); setElapsed(0);
-    setRunConfig({ target: id, mode, failPercent: percent, baselineS: b, failingS: f, totalS: b + f + r, rate });
+    setRunConfig({ target: id, mode, failPercent: percent, baselineS: b, failingS: f, totalS: b + f + r, rate, via });
     store.current = [];
+    firstError.current = null;
     cancel.current = false;
 
     const start = performance.now();
@@ -1071,10 +1394,11 @@ function HealthTab({
         }
         const phase: Phase = t < b * 1000 ? 'baseline' : t < (b + f) * 1000 ? 'failing' : 'recovery';
         const index = n++;
-        const job = probe(requestUrl(index, phase === 'failing', id, percent), giveUpMs).then((res) => {
+        const job = probe(requestUrl(index, phase === 'failing', id, percent), via, giveUpMs).then((res) => {
+          if (res.error && !firstError.current) firstError.current = res.error;
           // Only the target misbehaves, so while it's slow or hanging a 504 the
           // proxy generated itself is the proxy timing out on the target.
-          const timedOut = phase === 'failing' && mode !== 'error' && !res.backendId && res.status === 504;
+          const timedOut = phase === 'failing' && mode !== 'error' && !res.backendId && (res.status === 504 || res.status === UNREADABLE);
           // When the request actually reached the proxy. The browser holds
           // only a few connections to the dashboard, so while some hang, new
           // requests queue behind them and leave later than they were made.
@@ -1268,9 +1592,12 @@ function HealthTab({
               Stop · {elapsed.toFixed(0)}/{cfg?.totalS ?? 0}s
             </Button>
           )}
+          {via === 'browser' && (
+            <p className="text-muted-foreground text-xs">Runs from your browser: keep this tab open, and keep the rate low if the target is on this dashboard&rsquo;s own origin over HTTP/1.1.</p>
+          )}
           {samples.length > 0 && !running && (
             <Button block theme="link" onClick={() => download('alb-health-results.csv',
-              'n,t_ms,phase,backendId,instanceId,status\n' + samples.map((s) => `${s.n},${s.t.toFixed(0)},${s.phase},${s.backendId ?? ''},${s.instanceId ?? ''},${s.status}`).join('\n'))}>
+              'n,t_ms,phase,backendId,instanceId,status\n' + samples.map((s) => `${s.n},${s.t.toFixed(0)},${s.phase},${s.backendId ?? ''},${s.instanceId ?? ''},${statusLabel(s.status)}`).join('\n'))}>
               Export CSV
             </Button>
           )}
@@ -1303,6 +1630,8 @@ function HealthTab({
                   label="Re-admitted after"
                 />
               </motion.div>
+
+              {cfg.via === 'browser' && <motion.div variants={item}><FromBrowserNote errors={finished ? firstError.current : null} /></motion.div>}
 
               {summary && (
                 <motion.div variants={item} className="space-y-1.5 rounded-md border px-3 py-2.5 text-sm"
@@ -1400,6 +1729,7 @@ function HealthTab({
               {samples.some((s) => outcomeOf(s, cfg.target) === 'error') && (
                 <motion.p variants={item} className="text-muted-foreground text-xs">
                   {verdict?.errors} requests failed before a response (timeout or network error).
+                  {cfg.via === 'server' && firstError.current && ` First error: ${firstError.current}`}
                 </motion.p>
               )}
             </motion.div>
@@ -1430,8 +1760,8 @@ const OUTCOME_STYLE: Record<TimeoutOutcome, { label: string; color: string; badg
 const secs = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
 
 function TimeoutsTab({
-  base, target, item, container,
-}: { base: string; target: (p?: string) => string; item: Variants; container: Variants }) {
+  base, target, via, item, container,
+}: { base: string; target: (p?: string) => string; via: Via; item: Variants; container: Variants }) {
   const [failTarget, setFailTarget] = useState('');
   const [mode, setMode] = useState<SlowMode>('hang');
   const [delayS, setDelayS] = useState(20);
@@ -1440,13 +1770,14 @@ function TimeoutsTab({
   const [baselineS, setBaselineS] = useState(10);
   const [slowS, setSlowS] = useState(30);
   const [giveUpS, setGiveUpS] = useState(60);
-  const { detected, detecting, detect: detectTargets } = useDetect(target);
+  const { detected, detecting, detect: detectTargets } = useDetect(target, via);
   const [running, setRunning] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [samples, setSamples] = useState<TimeoutSample[]>([]);
+  const firstError = useRef<string | null>(null);
   // Settings of the run on screen, so editing the form doesn't re-analyse it.
   const [runConfig, setRunConfig] = useState<{
-    target: string; mode: SlowMode; delayS: number; failStatus: number; baselineS: number; slowS: number; giveUpS: number;
+    target: string; mode: SlowMode; delayS: number; failStatus: number; baselineS: number; slowS: number; giveUpS: number; via: Via;
   } | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const cancel = useRef(false);
@@ -1455,8 +1786,8 @@ function TimeoutsTab({
   async function detect() {
     if (!base) { setNote('Enter the proxy base URL above first.'); return; }
     setNote(null);
-    const { backends, instances } = await detectTargets();
-    if (!backends.length) setNote('No backend answered. Check the proxy URL and path.');
+    const { backends, instances, error } = await detectTargets();
+    if (!backends.length) setNote(`No backend answered. Check the proxy URL and path.${error ? ` (${error})` : ''}`);
     else if (!failTarget) setFailTarget(instances[0] ?? backends[backends.length - 1]);
   }
 
@@ -1472,8 +1803,9 @@ function TimeoutsTab({
     const totalMs = (b + s) * 1000;
 
     setRunning(true); setNote(null); setSamples([]); setElapsed(0);
-    setRunConfig({ target: id, mode, delayS: delay, failStatus, baselineS: b, slowS: s, giveUpS: giveUp });
+    setRunConfig({ target: id, mode, delayS: delay, failStatus, baselineS: b, slowS: s, giveUpS: giveUp, via });
     store.current = [];
+    firstError.current = null;
     cancel.current = false;
 
     const { backend, instance } = splitTarget(id);
@@ -1507,7 +1839,8 @@ function TimeoutsTab({
         }
         const phase: TimeoutPhase = t < b * 1000 ? 'baseline' : 'slow';
         const index = n++;
-        const job = probe(requestUrl(index, phase === 'slow'), giveUp * 1000).then((res) => {
+        const job = probe(requestUrl(index, phase === 'slow'), via, giveUp * 1000).then((res) => {
+          if (res.error && !firstError.current) firstError.current = res.error;
           store.current.push({
             n: index, t, phase,
             backendId: res.backendId, instanceId: res.instanceId,
@@ -1556,7 +1889,7 @@ function TimeoutsTab({
       ? `The proxy retried ${c.retried} on another endpoint (median ${secs(verdict.retriedMs!)} in all).`
       : 'The proxy retried none of them on another endpoint.');
     if (c['proxy-error'] && verdict.proxyWaitMs) {
-      const statuses = verdict.proxyStatuses.map((p) => p.status).join('/');
+      const statuses = verdict.proxyStatuses.map((p) => (p.status === UNREADABLE ? 'error (status unreadable from the browser)' : p.status)).join('/');
       const { p50, min, max } = verdict.proxyWaitMs;
       const wait = max - min < 500 ? secs(p50) : `${secs(min)}–${secs(max)}`;
       parts.push(`It gave up on ${c['proxy-error']}, returning its own ${statuses} after ${wait}.`);
@@ -1637,6 +1970,9 @@ function TimeoutsTab({
           <p className="text-muted-foreground text-xs">
             The dashboard stops waiting after &ldquo;give up after&rdquo; and counts the request as no response. Keep it longer than the proxy&rsquo;s timeout so you see the proxy give up, not the dashboard.
           </p>
+          {via === 'browser' && (
+            <p className="text-muted-foreground text-xs">Runs from your browser: keep this tab open while it runs.</p>
+          )}
 
           {!running ? (
             <Button block onClick={run}>Run timeouts test</Button>
@@ -1647,7 +1983,7 @@ function TimeoutsTab({
           )}
           {samples.length > 0 && !running && (
             <Button block theme="link" onClick={() => download('alb-timeouts-results.csv',
-              'n,t_ms,phase,backendId,instanceId,status,ms,outcome\n' + samples.map((s) => `${s.n},${s.t.toFixed(0)},${s.phase},${s.backendId ?? ''},${s.instanceId ?? ''},${s.status},${s.ms},${outcomeFor(s)}`).join('\n'))}>
+              'n,t_ms,phase,backendId,instanceId,status,ms,outcome\n' + samples.map((s) => `${s.n},${s.t.toFixed(0)},${s.phase},${s.backendId ?? ''},${s.instanceId ?? ''},${statusLabel(s.status)},${s.ms},${outcomeFor(s)}`).join('\n'))}>
               Export CSV
             </Button>
           )}
@@ -1668,7 +2004,7 @@ function TimeoutsTab({
                 <Stat n={verdict?.counts.retried ?? 0} label="Retried elsewhere" tone={verdict?.counts.retried ? 'var(--chart-2)' : undefined} />
                 <Stat
                   n={verdict?.proxyWaitMs
-                    ? <>{verdict.counts['proxy-error']}<Unit> · {verdict.proxyStatuses[0].status} at {secs(verdict.proxyWaitMs.p50)}</Unit></>
+                    ? <>{verdict.counts['proxy-error']}<Unit> · {statusLabel(verdict.proxyStatuses[0].status)} at {secs(verdict.proxyWaitMs.p50)}</Unit></>
                     : verdict?.counts['proxy-error'] ?? 0}
                   label="Proxy gave up"
                 />
@@ -1678,6 +2014,8 @@ function TimeoutsTab({
                   label="Share to target vs baseline"
                 />
               </motion.div>
+
+              {cfg.via === 'browser' && <motion.div variants={item}><FromBrowserNote errors={finished ? firstError.current : null} /></motion.div>}
 
               {summary && (
                 <motion.div variants={item} className="space-y-1.5 rounded-md border px-3 py-2.5 text-sm"
@@ -1702,7 +2040,7 @@ function TimeoutsTab({
                   {samples.map((s) => (
                     <div key={s.n} className="absolute size-1.5 -translate-x-1/2 translate-y-1/2 rounded-full"
                       style={{ left: `${Math.min(100, (s.t / totalMs) * 100)}%`, bottom: `${(s.ms / maxMs) * 100}%`, background: OUTCOME_STYLE[outcomeFor(s)].color }}
-                      title={`#${s.n} · ${s.status || 'no response'} · ${secs(s.ms)} · ${s.unit ?? 'proxy'}`} />
+                      title={`#${s.n} · ${s.status ? statusLabel(s.status) : 'no response'} · ${secs(s.ms)} · ${s.unit ?? 'proxy'}`} />
                   ))}
                   <span className="text-muted-foreground absolute left-1 top-0.5 text-[10px]">{secs(maxMs)}</span>
                 </div>
@@ -1733,7 +2071,7 @@ function TimeoutsTab({
                             <tr key={s.n}>
                               <Td>{s.n}</Td>
                               <Td>{secs(s.t)}</Td>
-                              <Td>{s.status || '—'}</Td>
+                              <Td>{s.status ? statusLabel(s.status) : '—'}</Td>
                               <Td>{secs(s.ms)}</Td>
                               <Td className="font-mono">{s.unit ? `${s.unit}${s.unit === cfg.target ? ' (target)' : ''}` : s.status ? 'proxy' : '—'}</Td>
                               <Td><Badge type={OUTCOME_STYLE[outcome].badge} className="whitespace-nowrap">{OUTCOME_STYLE[outcome].label}</Badge></Td>
@@ -1784,10 +2122,13 @@ async function stickyCall(host: string, method: 'GET' | 'POST' | 'DELETE', body?
     cache: 'no-store',
     ...(body && { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }),
   });
-  const data = await res.json().catch(() => null);
-  if (!res.ok) {
+  let data: any = null;
+  let notJson: string | null = null;
+  try { data = await apiJson(res); } catch (e) { notJson = messageOf(e); }
+  if (!res.ok || notJson) {
     throw new Error(
       data?.error ??
+      (res.status !== 401 && res.status !== 404 ? notJson : null) ??
       (res.status === 401 ? 'The instance refused the login (a different DASHBOARD_AUTH?)'
         : res.status === 404 ? 'No sticky failure there (no DASHBOARD_AUTH, ORIGIN_ONLY, or an older image)'
         : `HTTP ${res.status}`),
