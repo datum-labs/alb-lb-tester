@@ -5,7 +5,8 @@
 # backend instead shows it keeping its weighted share, which is expected.
 #
 # The networkService name and port come from the workload's NetworkService;
-# the Vercel backend alongside it is optional and shows the weights holding.
+# the alb-lb-tester-b backend alongside it is optional and shows the weights
+# holding.
 apiVersion: networking.datumapis.com/v1alpha
 kind: HTTPProxy
 metadata:
@@ -22,5 +23,7 @@ spec:
             name: alb-lb-tester
             port: http
           weight: 60
-        - endpoint: https://alb-tester-b.vercel.app
+        - networkService:
+            name: alb-lb-tester-b
+            port: http
           weight: 40

@@ -76,7 +76,18 @@ datumctl get httpproxy lb-tester --project <project> -o yaml
 
 **3. Run a test.** Open the dashboard (the URL `compute deploy` printed, with your login, or a local one), enter the proxy's URL, such as `https://<id>.datumproxy.net`, and send traffic.
 
-One workload is one backend with 3 instances, which is what health checks, failover and timeouts need. To compare **backends**, as weights, algorithms and ConsistentHash do, deploy two or three workloads with different names and `BACKEND_ID`s (`backend-a`, `backend-b`, ...) and give the rule one backend per workload, with a `weight` on each. The `examples/` folder has a manifest for each test.
+One workload is one backend with 3 instances, which is what health checks, failover and timeouts need. To compare **backends**, as weights, algorithms and ConsistentHash do, deploy one workload per backend, each with its own `BACKEND_ID`. One instance each is enough:
+
+```bash
+for x in a b c; do
+  datumctl compute deploy alb-lb-tester-$x --project <project> \
+    --image ghcr.io/datum-labs/alb-lb-tester:container-latest --runtime-class general-purpose \
+    --location us-east-1 --min 1 --http-port 3000 \
+    --env BACKEND_ID=backend-$x --env ORIGIN_ONLY=1
+done
+```
+
+The `examples/` folder has a manifest for each test. The ones that compare backends give the rule one `networkService` backend per workload (`alb-lb-tester-a`, `-b`, `-c`), with a `weight` on each where the test needs one.
 
 ## Run a test
 
@@ -253,7 +264,7 @@ The workflow also publishes unikernel images, `:latest` and `:sha-<commit>`, bui
 - The echo endpoint sends permissive CORS headers so the browser can read responses through the proxy, including every response header but `Set-Cookie` (`Access-Control-Expose-Headers: *`). It never pairs them with credentials.
 - A dashboard on Datum Compute can't currently reach Datum's edge, so the server-side tests can't reach a Datum proxy from there; the dashboard notices and switches to [browser mode](#browser-mode).
 - Responses set `Cache-Control: no-store` and the dashboard adds a cache-buster, so every request reaches an origin.
-- The distribution counts each backend by the `backendId` in its response, so a warm serverless instance and a cold one under the same `BACKEND_ID` still count as one backend, which is what you want when reasoning about the proxy's routing.
+- The distribution counts each backend by the `backendId` in its response, so all the instances of a workload, which share its `BACKEND_ID`, count as one backend, which is what you want when reasoning about the proxy's routing.
 
 ## Local development
 

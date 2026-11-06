@@ -131,7 +131,7 @@ export default function SetupPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  <Setting name="BACKEND_ID" use="Name each origin deployment, such as backend-a, backend-b, so the charts tell them apart. Without it, a deployment is named by its Vercel hostname, or local." />
+                  <Setting name="BACKEND_ID" use="Name each origin deployment, such as backend-a, backend-b, so the charts tell them apart. Without it, a deployment is named local." />
                   <Setting name="INSTANCE_ID" use="Name an instance yourself. Without it, each instance picks a random id when it starts." />
                   <Setting name="DASHBOARD_AUTH" use="user:password. Puts the dashboard, this page and the server-side tools behind a login, lets them reach *.datum.internal names, and turns on Sticky failure. Use it for any dashboard on a public URL. /api/whoami stays open." />
                   <Setting name="ORIGIN_ONLY" use="1 for a deployment that is only an origin: /api/whoami answers, everything else returns 404." />
