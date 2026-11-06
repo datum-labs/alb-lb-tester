@@ -5,7 +5,7 @@ import { dashboardAuth } from './app/dashboard-auth';
 // Basic auth for the dashboard, its server-side tools and the sticky failure
 // API, when DASHBOARD_AUTH is set. /api/whoami isn't matched, so it stays open.
 export const config = {
-  matcher: ['/', '/api/inspect', '/api/probe', '/api/sticky-failure'],
+  matcher: ['/', '/api/inspect', '/api/probe', '/api/reach', '/api/sticky-failure'],
 };
 
 function same(a: string, b: string): boolean {

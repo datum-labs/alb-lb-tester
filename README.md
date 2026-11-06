@@ -64,7 +64,7 @@ Open the dashboard, enter your **proxy hostname** (e.g. `https://your-alb.datump
 
 ## Features
 
-The dashboard has five tabs, all driven by the shared proxy URL at the top, plus a sixth, **Sticky failure**, behind a login (see [Sticky failure](#sticky-failure)).
+The dashboard has five tabs, all driven by the shared proxy URL at the top, plus a sixth, **Sticky failure**, behind a login (see [Sticky failure](#sticky-failure)). Below the URL, **Send test traffic from: Server | Browser** picks who sends the requests for Headers & redirect, WAF probes, Health checks and Timeouts & retries (see [Browser mode](#browser-mode)). Load balancing always runs from the browser, Sticky failure always from the server.
 
 **Load balancing** — fire a burst (or a continuous **Live** stream with a rolling req/s meter) and see:
 - Distribution bars per backend, with **expected-vs-observed** deltas when you enter the weights you configured
@@ -80,7 +80,8 @@ The dashboard has five tabs, all driven by the shared proxy URL at the top, plus
 Add your own **request headers to send** (for example a fake `X-Forwarded-For`) and headers for the **origin to send back** (`Server`, `Set-Cookie`, `Cache-Control`, CORS, ...), one `Name: Value` per line, or start from a preset. The **Client address** preset sends fake forwarding headers and says which header an app can trust for the client address, and which ones a client can set to anything. **Copy as evidence** copies the result as a short markdown table for a ticket or docs PR.
 
 Things to know:
-- The inspector runs on the dashboard's server, so "client address" is that server's address, not your browser's. To check from your own machine, use curl (see [Headers](#headers)).
+- The inspector runs on the dashboard's server, so "client address" is that server's address, not your browser's. To check from your own machine, use browser mode or curl (see [Headers](#headers)).
+- The whole inspection has an 11s budget, inside the 15s a Datum proxy in front of the dashboard allows, so a target that doesn't answer comes back as an error naming it rather than the edge's 504 page.
 - Origin headers need the target to be this tester's `/api/whoami`. The request comparison needs the origin to report headers as they arrived: the Datum Compute image does (`raw-headers.cjs` records them before Next fills in missing `X-Forwarded-*`); other deployments are flagged, because a forwarding header shown as added may come from Next, not the edge.
 - HTTP/2 lowercases header names and fetch doesn't keep their order, so case and order can't be checked.
 - The inspector, and the server-side probe the health checks use, only fetch `http` and `https` URLs on public addresses. Loopback, private, link-local and similar addresses are refused, after DNS and on every redirect, so the public dashboard can't be used to reach the network it runs in. `next dev` lifts this, as does `ALLOW_PRIVATE_TARGETS=1`, for testing an origin on your own machine. Behind a login (`DASHBOARD_AUTH`, see [Run on Datum Compute](#run-on-datum-compute)), they can also reach this network's instances by internal name, `<workload>-<network>-<location>-<n>.instances.datum.internal`.
@@ -93,7 +94,7 @@ Things to know:
 - How long after the failures stopped it was **re-admitted**
 - A per-second timeline of which backend or instance answered, with target 5xx and proxy-generated 5xx marked, and each one's share per phase
 
-Requests go through the server-side probe so a 503 the proxy generates itself (no CORS headers) is still counted, and told apart from the backend's own 503. A run that falls well below the requested rate is reported as inconclusive unless it still has enough failures to decide.
+Requests go through the server-side probe so a 503 the proxy generates itself (no CORS headers) is still counted, and told apart from the backend's own 503 (in browser mode, see its limits below). A run that falls well below the requested rate is reported as inconclusive unless it still has enough failures to decide.
 
 In the slow modes a request only counts as a failure if the proxy gives up on it first (15s on Datum) and returns its own 504. Only the target misbehaves, so that 504 is counted as a **timeout on the target**, at the time the proxy gave up. A delay shorter than the proxy's timeout is just a slow 200: passive health checks don't eject for latency, and the run says so. Two things to know for slow-mode runs:
 - **Use a RoundRobin load balancer.** With LeastRequest the proxy already sends less traffic to an endpoint that has requests stuck on it, which looks like an ejection before there is one.
@@ -111,6 +112,18 @@ To see an ejection, fail one endpoint of a backend that has several. For failove
 - no origin answered: the proxy **gave up** and returned its own error (status and how long it waited)
 
 It reports these counts, the target's share against baseline, a latency plot of every request, and a per-request table. Keep **Give up after** longer than the proxy's own timeout, so the run sees the proxy give up rather than the dashboard. A 5xx the proxy retries at once can't be told apart by timing from a request that never went to the target; a drop in the target's share is the sign of it.
+
+### Browser mode
+
+When the dashboard's server can't reach the proxy, the tests can run from your browser instead. The main case is a dashboard running on Datum Compute, which can't currently reach Datum's edge: every server-side test fails against a Datum proxy there.
+
+**Automatic check.** When you enter or change the proxy URL, the dashboard asks its own server, through `/api/reach`, to send one request to that host (3s timeout). The answer is kept per host for the page's lifetime. If the server can reach it, tests stay on **Server**. If not, they switch to **Browser** with a note saying the server can't reach the host; on Datum Compute (the server can resolve `*.instances.datum.internal` names) the note says Datum Compute can't currently reach Datum's edge. Your own choice wins: switch back to Server any time, and a later reachable host only undoes the automatic switch, not one you made. `/api/reach` follows the same rules as `/api/probe` (public addresses only, 404 under `ORIGIN_ONLY`, behind `DASHBOARD_AUTH` when that's set) and reports only whether an answer came back and its status.
+
+**What changes from the browser.** Requests go straight from your browser to the target, without cookies or a saved login, and timings and the client address are your machine's. The target is either on the dashboard's own origin (the proxy serving this dashboard), where everything is readable, or on another origin, where the browser reads a response only when it carries CORS headers. This tester's `/api/whoami` always does, and exposes every response header (`Access-Control-Expose-Headers: *`); an answer the proxy generates itself (a WAF block page, its own 504) doesn't. Per tab:
+
+- **Headers & redirect.** Request headers are sent with fetch, so a browser's forbidden headers (`Cookie`, `Host`, `Origin`, `Referer`, `Sec-*`, `Proxy-*`, ...) can't be sent: those lines and presets are marked server only. The browser adds its own headers (User-Agent, Sec-Fetch-*, ...) that a page can't list, so the request comparison covers only the headers you set; everything the origin received is still listed below it, from `/api/whoami`'s echo. The response comparison covers what the browser can read: never `Set-Cookie` (the Cookies preset is server only), and from another origin, only what the origin exposes. There, the CORS preset is server only too, since it would replace the CORS headers the browser needs. The browser follows redirects itself, so the http to https check reports only where the request ended up, not the redirect's status, and an https page can't request `http://` at all. HSTS is read from the response headers.
+- **WAF probes.** Same payloads, from the browser. From another origin a block page's status can't be read; when the request path is `/api/whoami` (the default), an attack that gets such an unreadable answer counts as blocked, and an unreadable benign answer (the home page, which sends no CORS headers) isn't judged.
+- **Health checks** and **Timeouts & retries.** Same runs, with the browser's own timeouts. From another origin, an answer the proxy generates itself is recorded as *unreadable* and counted as the proxy's own error, since that's what the proxy sends in these tests (its 503 or its 504 at 15s). Keep the tab open while a run goes.
 
 ## Failure injection
 
@@ -196,9 +209,9 @@ datumctl compute deploy alb-lb-tester --image ghcr.io/datum-labs/alb-lb-tester:l
   --location us-central-1 --min 3 --http-port 3000 --env BACKEND_ID=compute
 ```
 
-The server binds `::` because Compute instances only have IPv6 addresses; an image built before that fix needs `--env HOSTNAME=::`. Each instance picks its own id at start; set `INSTANCE_ID` to name them yourself. A deployment that only needs to be an origin, such as one behind a proxy that automated tests use, can set `ORIGIN_ONLY=1`: `/api/whoami` keeps answering, and the dashboard, `/api/inspect`, `/api/probe` and `/api/sticky-failure` return 404, so it doesn't expose public server-side fetch tools nobody there uses. The repository and its package are public, so the workload needs no image pull secret. A project without a network named `default` needs `--network <name> --yes`, which creates one.
+The server binds `::` because Compute instances only have IPv6 addresses; an image built before that fix needs `--env HOSTNAME=::`. Each instance picks its own id at start; set `INSTANCE_ID` to name them yourself. A deployment that only needs to be an origin, such as one behind a proxy that automated tests use, can set `ORIGIN_ONLY=1`: `/api/whoami` keeps answering, and the dashboard, `/api/inspect`, `/api/probe`, `/api/reach` and `/api/sticky-failure` return 404, so it doesn't expose public server-side fetch tools nobody there uses. The repository and its package are public, so the workload needs no image pull secret. A project without a network named `default` needs `--network <name> --yes`, which creates one.
 
-To put the dashboard behind a login, set `DASHBOARD_AUTH=user:password`. The dashboard, `/api/inspect` and `/api/probe` then need HTTP basic auth, and the inspector and probe may also reach `*.datum.internal` names, so a test can hit one instance directly. The login also turns on [sticky failure](#sticky-failure). `/api/whoami` stays open, since proxies, health checks and automated tests call it. The tools only take requests from the dashboard's own pages or from clients like curl, so another site can't use your saved login.
+To put the dashboard behind a login, set `DASHBOARD_AUTH=user:password`. The dashboard, `/api/inspect`, `/api/probe` and `/api/reach` then need HTTP basic auth, and the inspector and probe may also reach `*.datum.internal` names, so a test can hit one instance directly. The login also turns on [sticky failure](#sticky-failure). `/api/whoami` stays open, since proxies, health checks and automated tests call it. The tools only take requests from the dashboard's own pages or from clients like curl, so another site can't use your saved login.
 
 ### Regular container image
 
@@ -212,7 +225,8 @@ docker run -p 3000:3000 -e BACKEND_ID=local ghcr.io/datum-labs/alb-lb-tester:con
 
 ## Notes
 
-- The echo endpoint sends permissive CORS headers so the browser can read responses through the proxy.
+- The echo endpoint sends permissive CORS headers so the browser can read responses through the proxy, including every response header but `Set-Cookie` (`Access-Control-Expose-Headers: *`). It never pairs them with credentials.
+- A dashboard on Datum Compute can't currently reach Datum's edge, so the server-side tests can't reach a Datum proxy from there; the dashboard notices and switches to [browser mode](#browser-mode).
 - Responses set `Cache-Control: no-store` and the dashboard adds a cache-buster, so every request reaches an origin.
 - The distribution counts each backend by the `backendId` in its response, so a warm serverless instance and a cold one under the same `BACKEND_ID` still count as one backend, which is what you want when reasoning about the proxy's routing.
 
