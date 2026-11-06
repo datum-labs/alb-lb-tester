@@ -1,62 +1,84 @@
 # ALB Load-Balancer Tester
 
-A tiny site for exercising two Datum HTTPProxy features against real backends:
+A test bench for Datum's Application Load Balancer. Run it as origins on Datum Compute, put a Datum HTTPProxy in front of them, and the dashboard shows what the proxy does with real traffic: how it splits requests, when it ejects a failing instance, what it does with a hung request, which headers it adds or rewrites, and what its WAF blocks.
 
-- **Weighted backends per rule** ([network-services-operator#453](https://github.com/datum-cloud/network-services-operator/pull/453))
-- **Load-balancing algorithm** — RoundRobin, Random, LeastRequest, ConsistentHash ([#455](https://github.com/datum-cloud/network-services-operator/pull/455))
-- **Passive health checks** — outlier detection ejecting a backend that returns 5xx
+## What it tests
 
-It has two halves:
+| Area | What you see |
+| --- | --- |
+| **Load balancing** | Weighted backends, and the RoundRobin, Random, LeastRequest and ConsistentHash algorithms (on a header or the source IP): distribution against the weights you set, the order backends answered in, p50/p95 latency per backend, a sticky-session verdict, CSV export, and a continuous **Live** mode |
+| **Health checks** | Passive health checks (outlier detection): fail one backend or one instance with a 5xx, a delay, jitter, a hang, or only some requests, and see when it was ejected, retried and let back in |
+| **Failover** | Fail one of a workload's instances and watch its traffic move to the others, then come back |
+| **Timeouts & retries** | Make an origin hang, slow down or fail, and see per request whether the proxy waited, retried elsewhere, or gave up with its own error, and after how long |
+| **Headers & redirect** | What the edge adds, removes, rewrites or appends, on the request and the response, which header carries the client's real address, the `Host` the origin got, HSTS, and the http to https redirect. **Copy as evidence** makes a markdown table for a ticket |
+| **WAF probes** | XSS, SQL injection, command injection and path traversal payloads plus benign requests: block rate, false positives, per-payload results |
+| **Sticky failure** | Behind a login: leave one instance broken for every request, not just the tester's, until you reset it or it resets itself |
 
-1. **Origin echo** at `GET /api/whoami` — returns JSON naming which backend served the request (`backendId`), plus the client IP, Host header, and the `x-lb-key` header. This is what your HTTPProxy backends point at. Deploy it two or three times so you have distinct origins. Add `?fail=<backendId>` (comma-separated, or `*`) and the named backend misbehaves instead: by default it answers `?failStatus` (default 503), and it can also answer slowly, hang, or fail only some requests (see [Failure injection](#failure-injection)). Every other backend ignores it. Behind a login, one instance can also be left broken for every request until it's reset (see [Sticky failure](#sticky-failure)).
-2. **Dashboard** at `/` — fires a burst of requests through your proxy URL and charts which backend served each one, so you can see weights and algorithms at work.
+Every origin also takes [failure injection](#failure-injection) flags (`?fail=`) and can be asked to [send any response header](#headers), so you can script the same tests with curl.
 
-## Setup
+## How it works
 
-The dashboard's **Setup** page (`/setup`, linked from its header) is the guide to what runs where: the parts, which path test traffic takes from each tab (Server or Browser mode), the three ways to run the tester, its settings, and a quick start for each. In short:
+It's one app with two halves:
 
+1. **Origin echo** at `GET /api/whoami`: JSON naming which backend (`backendId`, from `BACKEND_ID`) and which instance (`instanceId`) answered, plus the client IP, the headers the origin received, and the headers it sent. This is what your HTTPProxy backends point at.
+2. **Dashboard** at `/`: sends test traffic through your proxy and charts which origin answered each request. Its **Setup** page (`/setup`) covers what runs where.
+
+The test requests go out from the dashboard's server, or from your browser. **Send test traffic from: Server | Browser**, under the proxy URL, picks which (see [Browser mode](#browser-mode)).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/traffic-paths-dark.svg">
+  <img alt="Server mode: your browser asks the dashboard's server to run the test, and the server sends the test requests to the proxy, which forwards them to the origins. Browser mode: the dashboard's server only serves the page, and your browser sends the test requests to the proxy." src="docs/diagrams/traffic-paths-light.svg" width="664">
+</picture>
+
+## Ways to run it
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/diagrams/ways-to-run-dark.svg">
+  <img alt="Three setups. Local or another cloud: the dashboard runs outside Datum and tests a proxy in front of origins on Datum Compute. Hosted on Datum Compute: one workload is both the dashboard and the origins, and proxy tests run from your browser because the dashboard can't currently reach Datum proxies. CI origin only: automated tests call the proxy in front of origins running with ORIGIN_ONLY=1." src="docs/diagrams/ways-to-run-light.svg" width="1004">
+</picture>
+
+- **Hosted on Datum Compute**: one workload with `DASHBOARD_AUTH` is both the dashboard and the origins. A dashboard on Datum Compute can't currently reach Datum proxies, so proxy tests run from your browser; the dashboard notices and switches for you. Sticky failure works only here, since it reaches each instance by its internal name.
 - **Local or another cloud**: the dashboard on your machine or a VM (`npm run dev`, or the `container-latest` image), the origins on Datum Compute behind your HTTPProxy. Tests run from the dashboard's server.
-- **Hosted on Datum Compute**: one workload with `DASHBOARD_AUTH` is both the dashboard and the origins. A dashboard on Datum Compute can't currently reach Datum proxies, so proxy tests run from the browser ([browser mode](#browser-mode)).
-- **CI origin only**: `ORIGIN_ONLY=1`, only `/api/whoami`, for automated tests.
+- **CI origin only**: `ORIGIN_ONLY=1` serves only `/api/whoami`, for automated tests.
 
-## Deploy the backends to Vercel
+## Quick start on Datum Compute
 
-Deploy this repo as **two or three separate Vercel projects**, each with a distinct `BACKEND_ID` environment variable:
-
-| Project | `BACKEND_ID` | Example URL |
-| --- | --- | --- |
-| alb-tester-a | `backend-a` | `https://alb-tester-a.vercel.app` |
-| alb-tester-b | `backend-b` | `https://alb-tester-b.vercel.app` |
-| alb-tester-c | `backend-c` | `https://alb-tester-c.vercel.app` |
+**1. Deploy the origins.** A workload with 3 instances, on Compute's general-purpose runtime. Add `--env DASHBOARD_AUTH=<user>:<password>` to host the dashboard on it too, or `--env ORIGIN_ONLY=1` when nobody will open a dashboard there. A project without a network named `default` needs `--network <name> --yes`.
 
 ```bash
-npm install -g vercel
-vercel --prod -e BACKEND_ID=backend-a   # repeat per project
+datumctl compute deploy alb-lb-tester --project <project> \
+  --image ghcr.io/datum-labs/alb-lb-tester:container-latest --runtime-class general-purpose \
+  --location us-east-1 --min 3 --http-port 3000 \
+  --env BACKEND_ID=compute --env DASHBOARD_AUTH=<user>:<password>
 ```
 
-If you skip `BACKEND_ID`, each deployment falls back to labelling itself by its Vercel hostname, which still works but reads less cleanly. The same deployment also serves the dashboard, so open any one of the URLs in a browser to drive tests.
-
-## Point an HTTPProxy at them
-
-The `examples/` folder has ready manifests. Set the endpoints to your deployed URLs, then apply against your project. Two weighted origins:
+**2. Put an HTTPProxy in front of it.** Point a backend at the workload's NetworkService (`datumctl get networkservices --project <project>` lists its name and port):
 
 ```yaml
 apiVersion: networking.datumapis.com/v1alpha
 kind: HTTPProxy
 metadata:
-  name: lb-tester-weighted
+  name: lb-tester
 spec:
   rules:
     - backends:
-        - endpoint: https://alb-tester-a.vercel.app
-          weight: 80
-        - endpoint: https://alb-tester-b.vercel.app
-          weight: 20
+        - networkService:
+            name: alb-lb-tester
+            port: http
 ```
 
-## Run a test
+```bash
+datumctl apply -f httpproxy.yaml --project <project>
 
-Open the dashboard, enter your **proxy hostname** (e.g. `https://your-alb.datumproxy.net`), and send traffic.
+# the hostname to enter as the proxy URL: status.canonicalHostname
+datumctl get httpproxy lb-tester --project <project> -o yaml
+```
+
+**3. Run a test.** Open the dashboard (the URL `compute deploy` printed, with your login, or a local one), enter the proxy's URL, such as `https://<id>.datumproxy.net`, and send traffic.
+
+One workload is one backend with 3 instances, which is what health checks, failover and timeouts need. To compare **backends**, as weights, algorithms and ConsistentHash do, deploy two or three workloads with different names and `BACKEND_ID`s (`backend-a`, `backend-b`, ...) and give the rule one backend per workload, with a `weight` on each. The `examples/` folder has a manifest for each test.
+
+## Run a test
 
 | Feature | How to test | Expected |
 | --- | --- | --- |
@@ -65,12 +87,14 @@ Open the dashboard, enter your **proxy hostname** (e.g. `https://your-alb.datump
 | ConsistentHash on header, sticky | Hash manifest with `header: x-lb-key`, key mode **Constant** | All requests hit one backend |
 | ConsistentHash on header, spread | Same manifest, key mode **Random** | Requests spread across backends |
 | ConsistentHash on source IP | SourceIP manifest, key mode None | All requests stick to one backend (one client IP) |
-| Passive health checks | Health-check manifest, **Health checks** tab, fail one backend | Target ejected after ~5 failures, retried after 30s, re-admitted once failures stop |
+| Passive health checks | `health-check-compute.yaml`, **Health checks** tab, fail one instance | Instance ejected after ~5 failures, retried after 30s, re-admitted once failures stop |
 | Health checks: slow, hang, flaky | **Health checks** tab, *How it fails*: Delay, Jitter, Hang, or *Fail %* under 100, RoundRobin proxy | Hang ejects after ~5 proxy timeouts; a delay under the proxy timeout is never ejected; a partial failure ejects only once 5 fail in a row |
 | Failover between instances | `failover-compute.yaml`, **Health checks** tab, fail one of 3 Compute instances | 5xx: ejected ~1s in after 3 failures; hang: ejected after 3 proxy timeouts (~18s); let back in once it recovers |
 | Timeouts & retries | **Timeouts & retries** tab, one Compute instance, Hang | Each request shows whether the proxy waited, retried elsewhere, or returned its own error, and after how long |
+| Headers | **Headers & redirect** tab, a preset such as **Client address** | Each header labelled unchanged, added, removed, rewritten or appended |
+| WAF | **WAF probes** tab, against a proxy with a WAF policy | Attacks blocked, benign requests let through |
 
-## Features
+## Dashboard tabs
 
 The dashboard has five tabs, all driven by the shared proxy URL at the top, plus a sixth, **Sticky failure**, behind a login (see [Sticky failure](#sticky-failure)). Below the URL, **Send test traffic from: Server | Browser** picks who sends the requests for Headers & redirect, WAF probes, Health checks and Timeouts & retries (see [Browser mode](#browser-mode)). Load balancing always runs from the browser, Sticky failure always from the server.
 
@@ -110,7 +134,7 @@ In the slow modes a request only counts as a failure if the proxy gives up on it
 
 ### What outlier detection does, and how to test it
 
-Outlier detection ejects **endpoints within a backend**. It doesn't move traffic between backends: a backend whose every endpoint fails keeps its weighted share. So failing a whole Vercel backend (one app behind shared anycast IPs) will always report *not ejected*, and that's the expected result.
+Outlier detection ejects **endpoints within a backend**. It doesn't move traffic between backends: a backend whose every endpoint fails keeps its weighted share. So failing a whole backend with a single endpoint, such as one `endpoint:` URL, will always report *not ejected*, and that's the expected result.
 
 To see an ejection, fail one endpoint of a backend that has several. For failover, `examples/failover-compute.yaml` tunes the same settings to eject after 3 failures for 10s. HTTPProxy has no primary/fallback backend, so failover is always between the instances of one backend. Run the tester as a **Datum Compute workload with 3 instances** and add it to the load balancer as a Datum compute backend (see `examples/health-check-compute.yaml`). Three instances rather than two: with max ejected at 50% one of three can go, and the other two keep the backend well above the proxy's panic threshold, where it would ignore health and route to every endpoint.
 
@@ -216,7 +240,7 @@ To put the dashboard behind a login, set `DASHBOARD_AUTH=user:password`. The das
 
 ### Other ways to run the image
 
-The `container-*` images run anywhere a container does:
+The `container-*` images run anywhere a container does, so the dashboard or an origin can also run on another host. Point an `endpoint:` backend at an origin outside Datum, and set `BACKEND_ID` on each one.
 
 ```bash
 docker run -p 3000:3000 -e BACKEND_ID=local ghcr.io/datum-labs/alb-lb-tester:container-latest
