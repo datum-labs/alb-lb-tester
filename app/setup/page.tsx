@@ -152,7 +152,7 @@ export default function SetupPage() {
                 Deploy the tester as a Compute workload with 3 instances. Add <Code>--env ORIGIN_ONLY=1</Code> when nobody will open a dashboard on it (the local and CI setups), or <Code>--env DASHBOARD_AUTH=&lt;user&gt;:&lt;password&gt;</Code> to host the dashboard on it. A project without a network named <Code>default</Code> needs <Code>--network &lt;name&gt; --yes</Code>.
               </p>
               <Pre>{`datumctl compute deploy alb-lb-tester --project <project> \\
-  --image ${IMAGE}:latest \\
+  --image ${IMAGE}:container-latest --runtime-class general-purpose \\
   --location <location> --min 3 --http-port 3000 \\
   --env BACKEND_ID=compute`}</Pre>
               <p>
@@ -191,7 +191,7 @@ docker run -p 3000:3000 -e BACKEND_ID=local ${IMAGE}:container-latest`}</Pre>
                 Deploy the origins as above with a login. Every instance needs the same <Code>DASHBOARD_AUTH</Code>, since Sticky failure sends your login to each one. Open the URL the deploy prints, log in, and enter the proxy&rsquo;s URL; tests switch to Browser mode on their own.
               </p>
               <Pre>{`datumctl compute deploy alb-lb-tester --project <project> \\
-  --image ${IMAGE}:latest \\
+  --image ${IMAGE}:container-latest --runtime-class general-purpose \\
   --location <location> --min 3 --http-port 3000 \\
   --env BACKEND_ID=compute --env DASHBOARD_AUTH=<user>:<password>`}</Pre>
               <p>
@@ -203,7 +203,7 @@ docker run -p 3000:3000 -e BACKEND_ID=local ${IMAGE}:container-latest`}</Pre>
               <SectionLabel>CI origin only</SectionLabel>
               <p>Same workload with <Code>ORIGIN_ONLY=1</Code> and no login, behind the HTTPProxy your tests call.</p>
               <Pre>{`datumctl compute deploy alb-lb-tester --project <project> \\
-  --image ${IMAGE}:latest \\
+  --image ${IMAGE}:container-latest --runtime-class general-purpose \\
   --location <location> --min 3 --http-port 3000 \\
   --env BACKEND_ID=compute --env ORIGIN_ONLY=1
 
@@ -211,7 +211,7 @@ curl https://<proxy-hostname>/api/whoami`}</Pre>
             </section>
 
             <p className="text-muted-foreground text-xs">
-              The <Code>latest</Code> tag runs on Compute&rsquo;s default unikernel runtime; <Code>container-latest</Code> runs anywhere a container does, including Compute&rsquo;s <Code>general-purpose</Code> runtime (<Code>--runtime-class general-purpose</Code>). The README has the full reference.
+              These commands use the <Code>container-latest</Code> image on Compute&rsquo;s <Code>general-purpose</Code> runtime. To move an existing workload to a newer build, deploy it with that build&rsquo;s <Code>container-sha-&lt;commit&gt;</Code> tag: Compute keeps running the image it already pulled for an unchanged tag. The README has the full reference.
             </p>
           </CardContent>
         </Card>
