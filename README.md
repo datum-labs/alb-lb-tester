@@ -11,6 +11,14 @@ It has two halves:
 1. **Origin echo** at `GET /api/whoami` — returns JSON naming which backend served the request (`backendId`), plus the client IP, Host header, and the `x-lb-key` header. This is what your HTTPProxy backends point at. Deploy it two or three times so you have distinct origins. Add `?fail=<backendId>` (comma-separated, or `*`) and the named backend misbehaves instead: by default it answers `?failStatus` (default 503), and it can also answer slowly, hang, or fail only some requests (see [Failure injection](#failure-injection)). Every other backend ignores it. Behind a login, one instance can also be left broken for every request until it's reset (see [Sticky failure](#sticky-failure)).
 2. **Dashboard** at `/` — fires a burst of requests through your proxy URL and charts which backend served each one, so you can see weights and algorithms at work.
 
+## Setup
+
+The dashboard's **Setup** page (`/setup`, linked from its header) is the guide to what runs where: the parts, which path test traffic takes from each tab (Server or Browser mode), the three ways to run the tester, its settings, and a quick start for each. In short:
+
+- **Local or another cloud**: the dashboard on your machine or a VM (`npm run dev`, or the `container-latest` image), the origins on Datum Compute behind your HTTPProxy. Tests run from the dashboard's server.
+- **Hosted on Datum Compute**: one workload with `DASHBOARD_AUTH` is both the dashboard and the origins. A dashboard on Datum Compute can't currently reach Datum proxies, so proxy tests run from the browser ([browser mode](#browser-mode)).
+- **CI origin only**: `ORIGIN_ONLY=1`, only `/api/whoami`, for automated tests.
+
 ## Deploy the backends to Vercel
 
 Deploy this repo as **two or three separate Vercel projects**, each with a distinct `BACKEND_ID` environment variable:
