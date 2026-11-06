@@ -160,7 +160,7 @@ function useReach(base: string, via: Via, setVia: (v: Via) => void) {
         const data = await apiJson(res);
         if (res.ok && typeof data.reachable === 'boolean') {
           const r: Reach = { host, reachable: data.reachable, onCompute: data.onCompute === true };
-          cache.current.set(host, r);
+          if (r.reachable) cache.current.set(host, r);
           apply(r);
         }
       } catch {
@@ -992,13 +992,20 @@ function WafTab({ base, path, via, item, container }: { base: string; path: stri
     const out: WafRow[] = [];
     // From the browser, another origin's block page has no CORS headers, so
     // its status can't be read. When the attacks go to /api/whoami, which
-    // always sends them, an unreadable answer came from the proxy: a block.
+    // always sends them, an unreadable answer is a block only when a benign
+    // /api/whoami control in this run was readable with 200.
     const attacksHitWhoami = /^\/?api\/whoami\b/.test(path);
     const attackUrl = (a: (typeof ATTACKS)[number]) => `${base}${path.startsWith('/') ? '' : '/'}${path}?${a.key}=${encodeURIComponent(a.value)}`;
     const jobs: { kind: 'attack' | 'benign'; label: string; url: string }[] = [
       ...ATTACKS.map((a) => ({ kind: 'attack' as const, label: a.label, url: attackUrl(a) })),
       ...BENIGN.map((b) => ({ kind: 'benign' as const, label: b.label, url: `${base}${b.path}` })),
     ];
+    let proxyServing = false;
+    if (via === 'browser' && attacksHitWhoami) {
+      const control = await browserFetch(`${base}/api/whoami`);
+      await control.res?.body?.cancel();
+      proxyServing = control.status === 200;
+    }
     for (const j of jobs) {
       let status = 0;
       if (via === 'browser') {
@@ -1006,7 +1013,7 @@ function WafTab({ base, path, via, item, container }: { base: string; path: stri
         await r.res?.body?.cancel();
         status = r.status;
         const unreadable = status === UNREADABLE;
-        out.push({ kind: j.kind, label: j.label, status, unreadable, blocked: status === 403 || (unreadable && j.kind === 'attack' && attacksHitWhoami) });
+        out.push({ kind: j.kind, label: j.label, status, unreadable, blocked: status === 403 || (unreadable && j.kind === 'attack' && proxyServing) });
         setRows(out.slice());
         continue;
       }
@@ -1041,7 +1048,7 @@ function WafTab({ base, path, via, item, container }: { base: string; path: stri
         <CardContent className="space-y-3">
           <p className="text-muted-foreground text-xs">Sends {ATTACKS.length} attack payloads (XSS, SQLi, command injection, traversal) and {BENIGN.length} benign requests. A protected proxy blocks the attacks with 403 and lets the benign ones through.</p>
           {via === 'browser' && (
-            <p className="text-muted-foreground text-xs">From your browser. From another origin, a block page has no CORS headers, so its status can&rsquo;t be read: with the request path on <span className="font-mono">/api/whoami</span>, an attack that gets an unreadable answer counts as blocked, and an unreadable benign answer isn&rsquo;t judged.</p>
+            <p className="text-muted-foreground text-xs">From your browser. From another origin, a block page has no CORS headers, so its status can&rsquo;t be read: with the request path on <span className="font-mono">/api/whoami</span>, an attack that gets an unreadable answer counts as blocked only if a benign request to that path was readable with 200 first, otherwise it shows as unknown. An unreadable benign answer isn&rsquo;t judged.</p>
           )}
           <Button block loading={running} onClick={run}>Run WAF probes</Button>
           {note && <p className="text-destructive text-xs">{note}</p>}
