@@ -8,6 +8,9 @@ name: Compute image
 # `container-*`), which runs anywhere a container does: Compute's
 # general-purpose runtime, Docker, other hosts. The unikernel image runs only
 # on Compute's unikernel runtime.
+#
+# And a unikernel build of go-httpbin from echo/ (tags `echo-*`), which
+# datum-cloud/infra's Chainsaw tests run on the unikernel runtime.
 
 on:
   push:
@@ -15,6 +18,7 @@ on:
     paths:
       - 'app/**'
       - 'Dockerfile.datum'
+      - 'echo/**'
       - 'next.config.mjs'
       - 'package.json'
       - 'package-lock.json'
@@ -78,6 +82,13 @@ jobs:
           datumctl compute build --analyze --push --output "${image}:sha-${GITHUB_SHA::12}" .
           datumctl compute build --push --output "${image}:latest" .
           echo "Pushed ${image}:sha-${GITHUB_SHA::12} and ${image}:latest" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build and push echo
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          datumctl compute build --analyze --push -f echo/Dockerfile.datum --output "${image}:echo-sha-${GITHUB_SHA::12}" echo
+          datumctl compute build --push -f echo/Dockerfile.datum --output "${image}:echo-latest" echo
+          echo "Pushed ${image}:echo-sha-${GITHUB_SHA::12} and ${image}:echo-latest" >> "$GITHUB_STEP_SUMMARY"
 
   container:
     runs-on: ubuntu-latest

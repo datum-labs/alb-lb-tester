@@ -1,0 +1,5 @@
+# go-httpbin as a Compute unikernel image, for infra's Unikraft Chainsaw tests
+# (datum-cloud/infra#8959). The upstream image is a single static binary, so
+# nothing needs copying. Compute instances only have IPv6 addresses: run with
+# HOST=:: (go-httpbin binds 0.0.0.0 by default).
+FROM ghcr.io/mccutchen/go-httpbin@sha256:0b5ee23649a6cb94fd990a6d6bf414d8b4bddcf6f783ab8dcb389a6bcbc5a926

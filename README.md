@@ -259,6 +259,8 @@ docker run -p 3000:3000 -e BACKEND_ID=local ghcr.io/datum-labs/alb-lb-tester:con
 
 The workflow also publishes unikernel images, `:latest` and `:sha-<commit>`, built with `datumctl compute build --analyze`. They run only on Compute's default unikernel runtime, and the container images on the general-purpose runtime are the tested path.
 
+The same workflow also builds `echo/Dockerfile.datum`, [go-httpbin](https://github.com/mccutchen/go-httpbin) as a unikernel image, and publishes it as `:echo-latest` and `:echo-sha-<commit>`. It isn't the tester: datum-cloud/infra's Chainsaw tests use it as a small, known HTTP origin on the unikernel runtime, pinned by digest. Run it with `HOST=::` and port 8080.
+
 ## Notes
 
 - The echo endpoint sends permissive CORS headers so the browser can read responses through the proxy, including every response header but `Set-Cookie` (`Access-Control-Expose-Headers: *`). It never pairs them with credentials.
