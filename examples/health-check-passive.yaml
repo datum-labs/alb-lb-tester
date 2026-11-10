@@ -2,9 +2,11 @@
 # consecutive 5xx is ejected for 30s, then re-admitted; repeat ejections last
 # longer. Use the dashboard's Health checks tab to make one backend fail.
 #
-# Outlier detection ejects endpoints within a backend, so a failing backend
-# with a single instance keeps its share and is never ejected: that's the
-# expected result. To see an ejection, use health-check-compute.yaml.
+# Outlier detection ejects endpoints within a backend and never moves traffic
+# between backends. Each backend here has a single instance, so a failing one
+# is ejected but keeps its share: while it's ejected, the proxy answers those
+# requests with its own 503. To see the traffic go to healthy instances
+# instead, use health-check-compute.yaml.
 #
 # Needs the alb-lb-tester-a and alb-lb-tester-b workloads (see "Quick start
 # on Datum Compute" in the README).
