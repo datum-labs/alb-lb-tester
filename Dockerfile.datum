@@ -22,7 +22,7 @@ RUN mkdir -p /out/app \
 
 # Node plus the shared libraries it links against, and nothing else: no shell,
 # no package manager, a small root filesystem to hold in RAM.
-FROM gcr.io/distroless/nodejs26-debian13@sha256:b462e87a3db156aea160dd8a5306b85d02c3061ca0e3194fe0af81282a830ab0
+FROM gcr.io/distroless/nodejs26-debian13@sha256:13e3ac17e2911d238622fea7808a7a161ba6b33a41e542ded6e399387e1dbc84
 COPY --from=build /out/app /app
 # Next's standalone server listens on $HOSTNAME. Compute instances get IPv6
 # addresses only, so bind "::" (every interface, IPv6 and IPv4); "0.0.0.0" is
